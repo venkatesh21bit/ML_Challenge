@@ -33,7 +33,7 @@ def _make_analyzer(ngram_range=(2, 4)):
 def build_tfidf_indexes(
     df: pd.DataFrame,
     ngram_range: tuple = (2, 4),
-    max_features: int = 300_000,
+    max_features: int = 150_000,   # 150K keeps sparse matrix ~2GB (was 300K → 4GB)
 ) -> tuple:
     """
     Build two TF-IDF vectorizers + sparse matrices for a source DataFrame.
@@ -54,14 +54,17 @@ def build_tfidf_indexes(
         for n, a in zip(names, addrs)
     ]
 
-    print(f"  Fitting name TF-IDF ({len(corpus_name):,} docs)...")
+    print(f"  Fitting name TF-IDF ({len(corpus_name):,} docs, max_features={max_features:,})...")
     vec_name = TfidfVectorizer(
         analyzer=_make_analyzer(),
         ngram_range=ngram_range,
         max_features=max_features,
         sublinear_tf=True,
+        min_df=2,   # ignore n-grams seen only once
     )
     mat_name = vec_name.fit_transform(corpus_name)
+    print(f"  mat_name: {mat_name.shape}, nnz={mat_name.nnz:,}, "
+          f"~{mat_name.data.nbytes/1e9:.1f}GB")
 
     print(f"  Fitting name+addr TF-IDF ({len(corpus_nameaddr):,} docs)...")
     vec_nameaddr = TfidfVectorizer(
@@ -69,8 +72,11 @@ def build_tfidf_indexes(
         ngram_range=ngram_range,
         max_features=max_features,
         sublinear_tf=True,
+        min_df=2,
     )
     mat_nameaddr = vec_nameaddr.fit_transform(corpus_nameaddr)
+    print(f"  mat_nameaddr: {mat_nameaddr.shape}, nnz={mat_nameaddr.nnz:,}, "
+          f"~{mat_nameaddr.data.nbytes/1e9:.1f}GB")
 
     return vec_name, mat_name, vec_nameaddr, mat_nameaddr, entity_ids
 
