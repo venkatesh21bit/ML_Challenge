@@ -214,29 +214,38 @@ def run_benchmark(
 
     # ── Error analysis on missed pairs ───────────────────────────────────────
     print("\n[ERROR ANALYSIS] Missed true pairs in FINAL_UNION:")
-    s1_id_map = {r["entity_id"]: r for _, r in s1_val.iterrows()}
-    s2_id_map = {r["entity_id"]: r for _, r in s2.iterrows()}
-    s3_id_map = {r["entity_id"]: r for _, r in s3.iterrows()}
-
-    missed_examples = []
+    missed_pairs = []
     for s1_eid, true_matches in gt_val.items():
         for tm in true_matches:
             if tm not in final_union.get(s1_eid, set()):
-                s1_r  = s1_id_map.get(s1_eid, {})
-                other_map = s2_id_map if tm.startswith("S2") else s3_id_map
-                s_r   = other_map.get(tm, {})
-                missed_examples.append({
-                    "s1_eid": s1_eid,
-                    "s1_name": s1_r.get("business_name", ""),
-                    "s1_addr": s1_r.get("business_address", ""),
-                    "match_eid": tm,
-                    "match_name": s_r.get("business_name", ""),
-                    "match_addr": s_r.get("business_address", ""),
-                })
-                if len(missed_examples) >= 20:
+                missed_pairs.append((s1_eid, tm))
+                if len(missed_pairs) >= 20:
                     break
-        if len(missed_examples) >= 20:
+        if len(missed_pairs) >= 20:
             break
+
+    if missed_pairs:
+        needed_s1 = {p[0] for p in missed_pairs}
+        needed_s2 = {p[1] for p in missed_pairs if p[1].startswith("S2")}
+        needed_s3 = {p[1] for p in missed_pairs if p[1].startswith("S3")}
+
+        s1_id_map = s1_val[s1_val["entity_id"].isin(needed_s1)].set_index("entity_id").to_dict("index")
+        s2_id_map = s2[s2["entity_id"].isin(needed_s2)].set_index("entity_id").to_dict("index") if needed_s2 else {}
+        s3_id_map = s3[s3["entity_id"].isin(needed_s3)].set_index("entity_id").to_dict("index") if needed_s3 else {}
+
+        missed_examples = []
+        for s1_eid, tm in missed_pairs:
+            s1_r = s1_id_map.get(s1_eid, {})
+            other_map = s2_id_map if tm.startswith("S2") else s3_id_map
+            s_r = other_map.get(tm, {})
+            missed_examples.append({
+                "s1_eid": s1_eid,
+                "s1_name": s1_r.get("business_name", ""),
+                "s1_addr": s1_r.get("business_address", ""),
+                "match_eid": tm,
+                "match_name": s_r.get("business_name", ""),
+                "match_addr": s_r.get("business_address", ""),
+            })
 
     if missed_examples:
         print("\n  Top missed pairs (analyze these to add new blocking rules):")

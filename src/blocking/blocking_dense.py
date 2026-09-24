@@ -22,8 +22,9 @@ import os
 from src.data.normalize import normalize_name, normalize_address, build_combined_text
 
 
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # 384-dim, fast, MIT
-# Backup: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" (French support)
+DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"   # 384-dim, multilingual (Indian scripts + French), Apache 2.0
+# Backup: "sentence-transformers/all-MiniLM-L6-v2" (English only)
+
 
 
 def encode_texts(
@@ -138,11 +139,23 @@ def run_dense_blocking(
     # Build combined texts for encoding
     if verbose:
         print(f"  Building combined texts for {len(s_other):,} source records...")
-    db_texts = [build_combined_text(row, weight_name=2) for _, row in s_other.iterrows()]
+    db_names = s_other["business_name"].fillna("").astype(str).tolist()
+    db_addrs = s_other["business_address"].fillna("").astype(str).tolist()
+    db_texts = [
+        build_combined_text({"business_name": n, "business_address": a}, weight_name=2)
+        for n, a in zip(db_names, db_addrs)
+    ]
+    del db_names, db_addrs
 
     if verbose:
         print(f"  Building combined texts for {len(s1):,} S1 records...")
-    q_texts = [build_combined_text(row, weight_name=2) for _, row in s1.iterrows()]
+    q_names = s1["business_name"].fillna("").astype(str).tolist()
+    q_addrs = s1["business_address"].fillna("").astype(str).tolist()
+    q_texts = [
+        build_combined_text({"business_name": n, "business_address": a}, weight_name=2)
+        for n, a in zip(q_names, q_addrs)
+    ]
+    del q_names, q_addrs
 
     # Encode database
     if index_cache_path and os.path.exists(index_cache_path):

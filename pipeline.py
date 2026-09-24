@@ -175,8 +175,13 @@ def run_full_pipeline(args):
     # ── 2. Val split ─────────────────────────────────────────────────────────
     val_frac = args.val_frac
     s1_val   = s1_train.sample(frac=val_frac, random_state=42)
-    s1_trn   = s1_train.drop(s1_val.index)
-    print(f"\n[SPLIT] train={len(s1_trn):,}  val={len(s1_val):,}")
+    s1_trn_all = s1_train.drop(s1_val.index)
+    if args.max_train_samples > 0 and len(s1_trn_all) > args.max_train_samples:
+        s1_trn = s1_trn_all.sample(n=args.max_train_samples, random_state=42).reset_index(drop=True)
+        print(f"\n[SPLIT] Sampled train={len(s1_trn):,} (from {len(s1_trn_all):,})  val={len(s1_val):,}")
+    else:
+        s1_trn = s1_trn_all.reset_index(drop=True)
+        print(f"\n[SPLIT] train={len(s1_trn):,}  val={len(s1_val):,}")
 
     # ── 3. Blocking on train ──────────────────────────────────────────────────
     print("\n[BLOCKING] Train set...")
@@ -332,9 +337,11 @@ if __name__ == "__main__":
                         help="full=train+predict | block-only=benchmark blocking")
     parser.add_argument("--val-frac",   type=float, default=0.05,
                         help="Fraction of S1 held out for validation (default 5%%)")
-    parser.add_argument("--top-k-name", type=int, default=20,
+    parser.add_argument("--max-train-samples", type=int, default=50000,
+                        help="Maximum training S1 samples for LightGBM matcher (0 for all, default 50k)")
+    parser.add_argument("--top-k-name", type=int, default=30,
                         help="TF-IDF top-k for name index")
-    parser.add_argument("--top-k-addr", type=int, default=30,
+    parser.add_argument("--top-k-addr", type=int, default=40,
                         help="TF-IDF top-k for name+address index")
     parser.add_argument("--sn-window",  type=int, default=10,
                         help="Sorted Neighbourhood window size")
