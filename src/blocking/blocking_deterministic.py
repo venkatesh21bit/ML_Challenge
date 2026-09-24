@@ -1,163 +1,159 @@
 """
 blocking_deterministic.py — Layer 1: Deterministic blocking rules.
 
-Generates candidate pairs using multiple blocking keys (country+name prefix,
-address prefix, sorted tokens, etc.) and returns their UNION.
+Uses UNIFIED vectorized normalization for BOTH index and query so keys
+always match. Longer prefixes (8-10 chars) keep buckets small and specific.
 
-For a 2M × 5M dataset this runs in seconds using dict-based inverted indexes.
+Key design decisions from data analysis (15 sample true pairs):
+  - 13/15 pairs share ≥7 chars of compact name prefix
+  - Word-order swaps ("Sarasva India" vs "limited sarasva india") handled by
+    sorted-token key after legal suffix stripping
+  - Domain names ("cardiologymetrocare.com") handled by 10-char prefix match
+  - No max_per_key cap (avg bucket size ~4, cap was cutting true matches)
 """
 
 import pandas as pd
 import numpy as np
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple, DefaultDict
-
-from src.data.normalize import build_blocking_keys, normalize_name, normalize_address, normalize_country
+from typing import Dict, List, Set, Tuple
 
 
-def build_inverted_index(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """Build inverted index (key -> list of entity_ids)."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared vectorized normalization (used for BOTH index build and query)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LEGAL_PAT = (
+    r"\b(pvt\.?\s*ltd\.?|private\s+limited|private\s+ltd\.?|p\.?\s*ltd\.?|"
+    r"llp|llc|inc\.?|corp\.?|corporation|limited|ltd\.?|co\.?|company|"
+    r"enterprises?|industries|industry|group|holdings?|trading|traders?|"
+    r"distributors?|solutions?|technologies|technology|tech|services?|"
+    r"international|intl\.?|s\.a\.s|s\.a\.|sarl|sas|eurl|srl|"
+    r"proprietorship|proprietor|prop\.?|& sons|and sons|brothers|bros\.?|"
+    r"pllc|plc|associates?|association|foundation|trust|school|college|"
+    r"hospital|clinic|center|centre)\b"
+)
+
+
+def _vec_norm_name(s: pd.Series) -> pd.Series:
+    """Vectorized name normalization: lower → strip legal → strip punct → collapse."""
+    return (
+        s.fillna("").astype(str)
+        .str.lower()
+        .str.replace(_LEGAL_PAT, " ", regex=True)
+        .str.replace(r"[^\w\s]", " ", regex=True)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+
+
+def _vec_norm_addr(s: pd.Series) -> pd.Series:
+    """Vectorized address normalization: lower → strip punct → collapse."""
+    return (
+        s.fillna("").astype(str)
+        .str.lower()
+        .str.replace(r"[^\w\s]", " ", regex=True)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+
+
+def _vec_norm_country(s: pd.Series) -> pd.Series:
+    return s.fillna("").astype(str).str.lower().str.strip()
+
+
+def _compute_keys(df: pd.DataFrame) -> Tuple[List, List, List, List, List, List]:
     """
-    Build an inverted index: blocking_key → [entity_id, ...]
-    for a source-2 or source-3 dataframe.
+    Compute all 6 blocking keys for a DataFrame, fully vectorized.
+    Returns 6 lists: key_a, key_b, key_c, key_d, key_e, key_f
     """
-    idx: Dict[str, List[str]] = defaultdict(list)
-    for _, row in df.iterrows():
-        keys = build_blocking_keys(row)
-        eid  = row["entity_id"]
-        for k in keys:
-            idx[k].append(eid)
-    return dict(idx)
+    names_v = _vec_norm_name(df["business_name"])
+    addrs_v = _vec_norm_addr(df["business_address"])
+    ctry_v  = _vec_norm_country(df["country"])
 
+    nc = names_v.str.replace(" ", "", regex=False)   # compact name
+    ac = addrs_v.str.replace(" ", "", regex=False)   # compact addr
+
+    # Key A: country|name_compact[:8]  (long enough to avoid huge buckets)
+    key_a = (ctry_v + "|" + nc.str[:8]).tolist()
+
+    # Key B: country|addr_compact[:8]
+    key_b = (ctry_v + "|" + ac.str[:8]).tolist()
+
+    # Key C: name_compact[:10]  (handles cross-country same-name)
+    key_c = nc.str[:10].tolist()
+
+    # Key D: sorted name tokens (handles word-order transpositions)
+    #   After legal strip: "Sarasva India" and "limited Sarasva India" both → "india sarasva"
+    key_d = names_v.str.split().apply(
+        lambda t: " ".join(sorted(t)[:5]) if isinstance(t, list) and t else ""
+    ).tolist()
+
+    # Key E: name_compact[:6]|addr_compact[:6] (combined discriminator)
+    key_e = (nc.str[:6] + "|" + ac.str[:6]).tolist()
+
+    # Key F: name_compact[:5]|country (short name + country, catches abbreviations)
+    key_f = (nc.str[:5] + "|" + ctry_v).tolist()
+
+    return key_a, key_b, key_c, key_d, key_e, key_f
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Index build
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_inverted_index_fast(df: pd.DataFrame) -> Dict[str, List[str]]:
     """
-    Vectorized inverted index builder. Computes all 5 blocking keys with
-    pandas string operations instead of per-row Python function calls.
-    ~5x faster than the loop version at 5M rows.
+    Build inverted index from S2/S3 DataFrame using vectorized key computation.
+    Returns: {blocking_key → [entity_id, ...]}
     """
-    _legal = (
-        r"\b(pvt\.?\s*ltd\.?|private\s+limited|private\s+ltd\.?|p\.?\s*ltd\.?|"
-        r"llp|llc|inc\.?|corp\.?|corporation|limited|ltd\.?|co\.?|company|"
-        r"enterprises?|industries|industry|group|holdings?|trading|traders?|"
-        r"distributors?|solutions?|technologies|technology|tech|services?|"
-        r"international|intl\.?|s\.a\.s|s\.a\.|sarl|sas|eurl|srl|"
-        r"proprietorship|proprietor|prop\.?|& sons|and sons|brothers|bros\.?)\b"
-    )
-
-    # Vectorized name normalization
-    names_v = (
-        df["business_name"].fillna("").astype(str)
-        .str.lower()
-        .str.replace(_legal, " ", regex=True)
-        .str.replace(r"[^\w\s]", " ", regex=True)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
-    # Vectorized address normalization (light)
-    addrs_v = (
-        df["business_address"].fillna("").astype(str)
-        .str.lower()
-        .str.replace(r"[^\w\s]", " ", regex=True)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
-    ctry_v = df["country"].fillna("").astype(str).str.lower().str.strip()
-
-    name_compact = names_v.str.replace(" ", "", regex=False)
-    addr_compact = addrs_v.str.replace(" ", "", regex=False)
-
-    eids  = df["entity_id"].tolist()
-    key_a = (ctry_v + "|" + name_compact.str[:4]).tolist()
-    key_b = (ctry_v + "|" + addr_compact.str[:5]).tolist()
-    key_c = name_compact.str[:6].tolist()
-    key_d = names_v.str.split().apply(
-        lambda t: " ".join(sorted(t)[:4]) if isinstance(t, list) and t else ""
-    ).tolist()
-    key_e = (name_compact.str[:3] + "|" + addr_compact.str[:3]).tolist()
+    eids = df["entity_id"].tolist()
+    key_a, key_b, key_c, key_d, key_e, key_f = _compute_keys(df)
 
     idx: Dict[str, List[str]] = defaultdict(list)
     for i, eid in enumerate(eids):
-        ka = key_a[i]
-        if len(ka) > 3:  idx[ka].append(eid)
-        kb = key_b[i]
-        if len(kb) > 3:  idx[kb].append(eid)
-        kc = key_c[i]
-        if len(kc) >= 3: idx[kc].append(eid)
-        kd = key_d[i]
-        if kd:           idx[kd].append(eid)
-        ke = key_e[i]
-        if len(ke) > 4:  idx[ke].append(eid)
+        ka = key_a[i]; (idx[ka].append(eid) if len(ka) > 5 else None)
+        kb = key_b[i]; (idx[kb].append(eid) if len(kb) > 5 else None)
+        kc = key_c[i]; (idx[kc].append(eid) if len(kc) >= 4 else None)
+        kd = key_d[i]; (idx[kd].append(eid) if len(kd) >= 4 else None)
+        ke = key_e[i]; (idx[ke].append(eid) if len(ke) > 6 else None)
+        kf = key_f[i]; (idx[kf].append(eid) if len(kf) > 4 else None)
 
     return dict(idx)
 
 
-def query_deterministic(
-    s1_row: dict,
-    idx: Dict[str, List[str]],
-    max_per_key: int = 50,
-) -> Set[str]:
-    """
-    For a single Source-1 record, retrieve all candidates from the
-    inverted index by taking the UNION across all blocking keys.
-
-    max_per_key: cap per individual key to avoid one dominant key flooding.
-    """
-    from src.data.normalize import (
-        normalize_name, normalize_address, normalize_country,
-        key_country_nameprefix, key_country_addr_prefix,
-        key_name_prefix, key_name_tokens_sorted, key_name_addr_prefix,
-    )
-
-    name    = normalize_name(str(s1_row.get("business_name", "")))
-    addr    = normalize_address(str(s1_row.get("business_address", "")))
-    country = normalize_country(str(s1_row.get("country", "")))
-
-    candidates: Set[str] = set()
-
-    for key_fn, args in [
-        (key_country_nameprefix, (country, name, 4)),
-        (key_country_addr_prefix, (country, addr, 5)),
-        (key_name_prefix,         (name, 6)),
-        (key_name_tokens_sorted,  (name,)),
-        (key_name_addr_prefix,    (name, addr, 3, 3)),
-    ]:
-        k = key_fn(*args)
-        hits = idx.get(k, [])
-        candidates.update(hits[:max_per_key])
-
-    return candidates
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch query (vectorized — processes all S1 records at once)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_deterministic_blocking(
     s1: pd.DataFrame,
     s_other: pd.DataFrame,
-    max_per_key: int = 50,
+    max_per_key: int = 300,   # high cap — avg bucket ~4, cap only prevents catastrophic buckets
     verbose: bool = True,
 ) -> Dict[str, Set[str]]:
     """
-    Full deterministic blocking pass.
+    Full deterministic blocking pass with unified vectorized normalization.
     Returns: {s1_entity_id → set of candidate entity_ids}
     """
     if verbose:
         print(f"  Building inverted index for {len(s_other):,} records...")
     idx = build_inverted_index_fast(s_other)
     if verbose:
-        print(f"  Index has {len(idx):,} unique keys")
+        print(f"  Index has {len(idx):,} unique keys, "
+              f"avg bucket={sum(len(v) for v in idx.values())/len(idx):.1f}")
+
+    # Compute S1 keys with SAME vectorized normalization
+    s1_eids = s1["entity_id"].tolist()
+    ka1, kb1, kc1, kd1, ke1, kf1 = _compute_keys(s1)
 
     result: Dict[str, Set[str]] = {}
-    names    = s1["business_name"].fillna("").astype(str).tolist()
-    addrs    = s1["business_address"].fillna("").astype(str).tolist()
-    countries= s1["country"].fillna("").astype(str).tolist()
-    eids     = s1["entity_id"].tolist()
-
-    for i, eid in enumerate(eids):
-        row = {
-            "business_name": names[i],
-            "business_address": addrs[i],
-            "country": countries[i],
-        }
-        result[eid] = query_deterministic(row, idx, max_per_key)
+    for i, eid in enumerate(s1_eids):
+        cands: Set[str] = set()
+        for k in [ka1[i], kb1[i], kc1[i], kd1[i], ke1[i], kf1[i]]:
+            hits = idx.get(k, [])
+            if hits:
+                cands.update(hits[:max_per_key])
+        result[eid] = cands
 
     if verbose:
         sizes = [len(v) for v in result.values()]
