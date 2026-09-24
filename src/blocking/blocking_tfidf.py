@@ -12,8 +12,9 @@ Two indexes are built per source:
   Index A — name only (identity)
   Index B — name + address (geographical discrimination)
 
-Uses memory-isolated sequential index processing and sparse matrix top-k
-retrieval (zero dense array allocation) to fit within 8 GB RAM on 5M records.
+Uses memory-isolated sequential index processing, character (3, 5) n-grams,
+max_df filtering, zero-copy CSC matrix transpose, and small-batch sparse top-k
+retrieval (zero dense array allocation) to fit within 6-8 GB RAM on 5M records.
 """
 
 import gc
@@ -37,23 +38,25 @@ def query_tfidf_batch(
     mat: sp.csr_matrix,
     entity_ids: List[str],
     top_k: int = 30,
-    batch_size: int = 256,
+    batch_size: int = 32,
 ) -> List[List[str]]:
     """
     Retrieve top-k candidates for a batch of query texts.
     Returns list of lists of entity_ids.
     Uses sparse-sparse matrix multiplication without converting to dense arrays.
+    mat.T is already a CSC matrix sharing the same data buffers (0 extra memory).
+    Small batch_size (32) keeps intermediate product matrix small and fast.
     """
     q_mat = vec.transform(query_texts)   # (Q, V) in CSR format
     n_queries = q_mat.shape[0]
     results = []
 
-    # Transpose database matrix to CSR format once for fast row-oriented multiplication
-    mat_T = mat.T.tocsr()
+    # In scipy, transposing CSR yields CSC without duplicating internal arrays
+    mat_T = mat.T
 
     for start in range(0, n_queries, batch_size):
         end = min(start + batch_size, n_queries)
-        q_batch = q_mat[start:end]                        # (B, V)
+        q_batch = q_mat[start:end]                        # (B, V) CSR
         prod = q_batch @ mat_T                            # (B, N) sparse CSR
 
         # Extract top-k per query directly from CSR row slices
@@ -78,8 +81,9 @@ def query_tfidf_batch(
 
 def build_tfidf_indexes(
     df: pd.DataFrame,
-    ngram_range: tuple = (2, 4),
-    max_features: int = 150_000,
+    ngram_range: tuple = (3, 5),
+    max_features: int = 100_000,
+    max_df: float = 0.8,
 ) -> tuple:
     """
     Build two TF-IDF vectorizers + sparse matrices for a source DataFrame.
@@ -104,6 +108,7 @@ def build_tfidf_indexes(
         analyzer=_make_analyzer(),
         ngram_range=ngram_range,
         max_features=max_features,
+        max_df=max_df,
         sublinear_tf=True,
         min_df=2,
         dtype=np.float32,
@@ -117,6 +122,7 @@ def build_tfidf_indexes(
         analyzer=_make_analyzer(),
         ngram_range=ngram_range,
         max_features=max_features,
+        max_df=max_df,
         sublinear_tf=True,
         min_df=2,
         dtype=np.float32,
@@ -133,9 +139,10 @@ def run_tfidf_blocking(
     s_other: pd.DataFrame,
     top_k_name: int = 30,
     top_k_nameaddr: int = 40,
-    ngram_range: tuple = (2, 4),
-    max_features: int = 150_000,
-    batch_size: int = 256,
+    ngram_range: tuple = (3, 5),
+    max_features: int = 100_000,
+    max_df: float = 0.8,
+    batch_size: int = 32,
     verbose: bool = True,
 ) -> Dict[str, Set[str]]:
     """
@@ -157,6 +164,7 @@ def run_tfidf_blocking(
         analyzer=_make_analyzer(),
         ngram_range=ngram_range,
         max_features=max_features,
+        max_df=max_df,
         sublinear_tf=True,
         min_df=2,
         dtype=np.float32,
@@ -196,6 +204,7 @@ def run_tfidf_blocking(
         analyzer=_make_analyzer(),
         ngram_range=ngram_range,
         max_features=max_features,
+        max_df=max_df,
         sublinear_tf=True,
         min_df=2,
         dtype=np.float32,
