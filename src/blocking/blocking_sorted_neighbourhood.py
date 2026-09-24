@@ -44,12 +44,22 @@ def run_sorted_neighbourhood(
     if verbose:
         print(f"  Building sort keys for {len(s1)+len(s_other):,} records (window={window_size})...")
 
-    # Build sort keys
-    s1_rows    = s1[["entity_id", "business_name", "business_address", "country"]].copy()
-    other_rows = s_other[["entity_id", "business_name", "business_address", "country"]].copy()
+    # Build sort keys — vectorized (avoid apply() at 5M scale)
+    s1_rows    = s1[["entity_id", "business_name", "country"]].copy()
+    other_rows = s_other[["entity_id", "business_name", "country"]].copy()
 
-    s1_rows["_sort_key"]    = s1_rows.apply(_build_sort_key, axis=1)
-    other_rows["_sort_key"] = other_rows.apply(_build_sort_key, axis=1)
+    def _make_sort_keys_vec(df: pd.DataFrame) -> pd.Series:
+        countries = df["country"].fillna("").astype(str).str.lower().str.strip()
+        names = (
+            df["business_name"].fillna("").astype(str)
+            .str.lower()
+            .str.replace(r"[^\w\s]", " ", regex=True)
+            .str.replace(r"\s+", "", regex=True)
+        )
+        return countries + "|" + names
+
+    s1_rows["_sort_key"]    = _make_sort_keys_vec(s1_rows)
+    other_rows["_sort_key"] = _make_sort_keys_vec(other_rows)
     s1_rows["_is_s1"]       = True
     other_rows["_is_s1"]    = False
 

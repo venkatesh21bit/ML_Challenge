@@ -33,15 +33,16 @@ from src.blocking.candidate_union           import union_candidates, candidate_s
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_ground_truth(gt: pd.DataFrame) -> Dict[str, Set[str]]:
-    """Parse ground truth TSV into {s1_eid → set of matched eids}."""
+    """Parse ground truth TSV into {s1_eid → set of matched eids}. Vectorized."""
+    eids = gt["source1_entity_id"].tolist()
+    raws = gt["matched_entity_ids"].fillna("").astype(str).tolist()
     result = {}
-    for _, row in gt.iterrows():
-        s1_eid = row["source1_entity_id"]
-        raw    = str(row.get("matched_entity_ids", ""))
-        if pd.isna(row.get("matched_entity_ids")) or raw.strip() == "" or raw == "nan":
-            result[s1_eid] = set()
+    for eid, raw in zip(eids, raws):
+        raw = raw.strip()
+        if not raw or raw == "nan":
+            result[eid] = set()
         else:
-            result[s1_eid] = set(x.strip() for x in raw.split(",") if x.strip())
+            result[eid] = set(x.strip() for x in raw.split(",") if x.strip())
     return result
 
 

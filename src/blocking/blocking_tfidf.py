@@ -46,10 +46,13 @@ def build_tfidf_indexes(
         normalize_name(str(n)) for n in df["business_name"].fillna("")
     ]
 
-    # Corpus B: name (×2) + address
-    corpus_nameaddr = []
-    for _, row in df.iterrows():
-        corpus_nameaddr.append(build_combined_text(row, weight_name=2))
+    # Corpus B: name (×2) + address — use zip instead of iterrows (100× faster)
+    names  = df["business_name"].fillna("").astype(str).tolist()
+    addrs  = df["business_address"].fillna("").astype(str).tolist()
+    corpus_nameaddr = [
+        build_combined_text({"business_name": n, "business_address": a}, weight_name=2)
+        for n, a in zip(names, addrs)
+    ]
 
     print(f"  Fitting name TF-IDF ({len(corpus_name):,} docs)...")
     vec_name = TfidfVectorizer(
@@ -130,9 +133,12 @@ def run_tfidf_blocking(
     q_name = [
         normalize_name(str(n)) for n in s1["business_name"].fillna("")
     ]
-    q_nameaddr = []
-    for _, row in s1.iterrows():
-        q_nameaddr.append(build_combined_text(row, weight_name=2))
+    q_names = s1["business_name"].fillna("").astype(str).tolist()
+    q_addrs = s1["business_address"].fillna("").astype(str).tolist()
+    q_nameaddr = [
+        build_combined_text({"business_name": n, "business_address": a}, weight_name=2)
+        for n, a in zip(q_names, q_addrs)
+    ]
 
     if verbose:
         print(f"  Querying name index (top_k={top_k_name}) for {len(s1):,} S1 records...")
