@@ -108,6 +108,7 @@ def benchmark_single_pass(
 def run_benchmark(
     train_dir: str,
     val_frac: float = 0.05,
+    max_val_samples: int = 10000,
     top_k_tfidf_name: int = 20,
     top_k_tfidf_nameaddr: int = 30,
     top_k_dense: int = 30,
@@ -116,6 +117,7 @@ def run_benchmark(
     skip_dense: bool = True,   # skip dense by default (slow at 5M scale without GPU)
     seed: int = 42,
 ):
+    import gc
     print("=" * 70)
     print("BLOCKING BENCHMARK — Amazon ML Challenge")
     print("=" * 70)
@@ -130,10 +132,15 @@ def run_benchmark(
     print(f"  S1: {len(s1):,}  S2: {len(s2):,}  S3: {len(s3):,}  GT: {len(gt):,}")
 
     # ── Validation split from S1 ─────────────────────────────────────────────
-    print(f"\n[2] Sampling {val_frac*100:.0f}% of S1 for fast validation...")
-    s1_val = s1.sample(frac=val_frac, random_state=seed).reset_index(drop=True)
+    val_size = min(int(len(s1) * val_frac), max_val_samples) if max_val_samples > 0 else int(len(s1) * val_frac)
+    print(f"\n[2] Sampling {val_size:,} of S1 for fast validation (capped at {max_val_samples:,})...")
+    s1_val = s1.sample(n=val_size, random_state=seed).reset_index(drop=True)
     gt_dict = parse_ground_truth(gt)
     gt_val  = {eid: gt_dict.get(eid, set()) for eid in s1_val["entity_id"]}
+
+    # Free memory immediately to prevent Colab OOM
+    del s1, gt, gt_dict
+    gc.collect()
 
     print(f"  Val S1 size: {len(s1_val):,}")
     n_with_matches = sum(1 for v in gt_val.values() if v)

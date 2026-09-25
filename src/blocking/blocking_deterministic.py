@@ -101,9 +101,10 @@ def _compute_keys(df: pd.DataFrame) -> Tuple[List, List, List, List, List, List]
 # Index build
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_inverted_index_fast(df: pd.DataFrame) -> Dict[str, List[str]]:
+def build_inverted_index_fast(df: pd.DataFrame, max_bucket_size: int = 150) -> Dict[str, List[str]]:
     """
     Build inverted index from S2/S3 DataFrame using vectorized key computation.
+    Skips mega-buckets (> max_bucket_size) to avoid noisy stop-word collisions.
     Returns: {blocking_key → [entity_id, ...]}
     """
     eids = df["entity_id"].tolist()
@@ -112,13 +113,16 @@ def build_inverted_index_fast(df: pd.DataFrame) -> Dict[str, List[str]]:
     idx: Dict[str, List[str]] = defaultdict(list)
     for i, eid in enumerate(eids):
         ka = key_a[i]; (idx[ka].append(eid) if len(ka) > 5 else None)
-        kb = key_b[i]; (idx[kb].append(eid) if len(kb) > 5 else None)
-        kc = key_c[i]; (idx[kc].append(eid) if len(kc) >= 4 else None)
+        kb = key_b[i]; (idx[kb].append(eid) if len(kb) > 8 else None)  # min 8 chars for address
+        kc = key_c[i]; (idx[kc].append(eid) if len(kc) >= 5 else None)
         kd = key_d[i]; (idx[kd].append(eid) if len(kd) >= 4 else None)
         ke = key_e[i]; (idx[ke].append(eid) if len(ke) > 6 else None)
-        kf = key_f[i]; (idx[kf].append(eid) if len(kf) > 4 else None)
+        kf = key_f[i]; (idx[kf].append(eid) if len(kf) > 6 else None)  # min 6 chars for short name+country
 
-    return dict(idx)
+    # Filter out mega-buckets (stop-words / generic terms like 'hotel' or 'near bus stand')
+    filtered_idx = {k: v for k, v in idx.items() if len(v) <= max_bucket_size}
+    del idx
+    return filtered_idx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,13 +132,15 @@ def build_inverted_index_fast(df: pd.DataFrame) -> Dict[str, List[str]]:
 def run_deterministic_blocking(
     s1: pd.DataFrame,
     s_other: pd.DataFrame,
-    max_per_key: int = 300,   # high cap — avg bucket ~4, cap only prevents catastrophic buckets
+    max_per_key: int = 40,        # max candidates from any single key
+    max_cands_per_s1: int = 80,   # hard cap per entity for deterministic pass
     verbose: bool = True,
 ) -> Dict[str, Set[str]]:
     """
     Full deterministic blocking pass with unified vectorized normalization.
     Returns: {s1_entity_id → set of candidate entity_ids}
     """
+    import gc
     if verbose:
         print(f"  Building inverted index for {len(s_other):,} records...")
     idx = build_inverted_index_fast(s_other)
@@ -153,7 +159,12 @@ def run_deterministic_blocking(
             hits = idx.get(k, [])
             if hits:
                 cands.update(hits[:max_per_key])
+                if len(cands) >= max_cands_per_s1:
+                    break
         result[eid] = cands
+
+    del idx
+    gc.collect()
 
     if verbose:
         sizes = [len(v) for v in result.values()]

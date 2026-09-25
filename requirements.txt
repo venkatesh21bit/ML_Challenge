@@ -1,9 +1,31 @@
+## Core ML
 scikit-learn>=1.3.0
-faiss-cpu>=1.7.4
-sentence-transformers>=2.2.2
-pandas>=2.0.0
 numpy>=1.24.0
-tqdm>=4.65.0
+pandas>=2.0.0
+scipy>=1.11.0
+
+## Blocking
+faiss-cpu>=1.7.4           # CPU; use faiss-gpu on Colab
+sentence-transformers>=2.2.2
+
+## GBM Matchers
 lightgbm>=4.0.0
 catboost>=1.2
-scipy>=1.11.0
+
+## String Similarity
+rapidfuzz>=3.0.0
+jellyfish>=1.0.0
+
+## Transformer Models (cross-encoder)
+transformers>=4.38.0
+torch>=2.0.0
+accelerate>=0.27.0
+sentencepiece>=0.1.99       # required for DeBERTa tokenizer
+protobuf>=3.20.0
+
+## BGE Embeddings + Reranker
+FlagEmbedding>=1.2.0        # BAAI/bge-m3 and bge-reranker
+
+## Utilities
+tqdm>=4.65.0
+optuna>=3.3.0               # optional: hyperparameter tuning
