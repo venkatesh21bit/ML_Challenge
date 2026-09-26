@@ -22,39 +22,56 @@ from typing import Dict, List, Set, Tuple
 # Shared vectorized normalization (used for BOTH index build and query)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Honorific / generic business prefix patterns ────────────────────────────
+_HONORIFIC_PAT = (
+    r"^(shri|sri|shree|m/s|ms|dr|doctor|prof|the)\b\s*"
+)
+
+# ── Legal suffix patterns ────────────────────────────────────────────────────
 _LEGAL_PAT = (
     r"\b(pvt\.?\s*ltd\.?|private\s+limited|private\s+ltd\.?|p\.?\s*ltd\.?|"
     r"llp|llc|inc\.?|corp\.?|corporation|limited|ltd\.?|co\.?|company|"
     r"enterprises?|industries|industry|group|holdings?|trading|traders?|"
     r"distributors?|solutions?|technologies|technology|tech|services?|"
-    r"international|intl\.?|s\.a\.s|s\.a\.|sarl|sas|eurl|srl|"
+    r"international|intl\.?|plc|gmbh|s\.a\.s|s\.a\.|sarl|sas|eurl|srl|"
     r"proprietorship|proprietor|prop\.?|& sons|and sons|brothers|bros\.?|"
-    r"pllc|plc|associates?|association|foundation|trust|school|college|"
-    r"hospital|clinic|center|centre)\b"
+    r"pllc|associates?|association|foundation|trust)\b"
 )
+
+# Common street abbreviations
+_STREET_ABBREV = {
+    r"\bct\b": "court",
+    r"\brd\b": "road",
+    r"\bst\b": "street",
+    r"\bdr\b": "drive",
+    r"\bpl\b": "place",
+    r"\bflr\b|\bfl\b": "floor",
+    r"\bave\b|\bav\b": "avenue",
+    r"\bblvd\b": "boulevard",
+    r"\bln\b": "lane",
+    r"\bhno\b": "house",
+    r"\bapt\b": "apartment",
+}
 
 
 def _vec_norm_name(s: pd.Series) -> pd.Series:
-    """Vectorized name normalization: lower → strip legal → strip punct → collapse."""
-    return (
-        s.fillna("").astype(str)
-        .str.lower()
-        .str.replace(_LEGAL_PAT, " ", regex=True)
-        .str.replace(r"[^\w\s]", " ", regex=True)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
+    """Vectorized name normalization: strip honorifics → strip legal → collapse."""
+    res = s.fillna("").astype(str).str.lower()
+    res = res.str.replace(_HONORIFIC_PAT, "", regex=True)
+    res = res.str.replace(_LEGAL_PAT, " ", regex=True)
+    res = res.str.replace(r"[^\w\s]", " ", regex=True)
+    res = res.str.replace(r"\s+", " ", regex=True)
+    return res.str.strip()
 
 
 def _vec_norm_addr(s: pd.Series) -> pd.Series:
-    """Vectorized address normalization: lower → strip punct → collapse."""
-    return (
-        s.fillna("").astype(str)
-        .str.lower()
-        .str.replace(r"[^\w\s]", " ", regex=True)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
+    """Vectorized address normalization: expand abbreviations → strip punct."""
+    res = s.fillna("").astype(str).str.lower()
+    for pat, rep in _STREET_ABBREV.items():
+        res = res.str.replace(pat, rep, regex=True)
+    res = res.str.replace(r"[^\w\s]", " ", regex=True)
+    res = res.str.replace(r"\s+", " ", regex=True)
+    return res.str.strip()
 
 
 def _vec_norm_country(s: pd.Series) -> pd.Series:
@@ -63,36 +80,44 @@ def _vec_norm_country(s: pd.Series) -> pd.Series:
 
 def _compute_keys(df: pd.DataFrame) -> Tuple[List, List, List, List, List, List]:
     """
-    Compute all 6 blocking keys for a DataFrame, fully vectorized.
-    Returns 6 lists: key_a, key_b, key_c, key_d, key_e, key_f
+    Compute 6 high-precision deterministic blocking keys:
+      1. key_a: country|compact_name[:8]
+      2. key_b: country|first_significant_name_token
+      3. key_c: country|sorted_tokens[:3] (handles word transpositions)
+      4. key_d: country|house_number|street_token (anchors exact location)
+      5. key_e: country|pin_code (5-6 digits)
+      6. key_f: country|compact_name[:5] (handles short names / abbreviations)
     """
     names_v = _vec_norm_name(df["business_name"])
     addrs_v = _vec_norm_addr(df["business_address"])
     ctry_v  = _vec_norm_country(df["country"])
 
     nc = names_v.str.replace(" ", "", regex=False)   # compact name
-    ac = addrs_v.str.replace(" ", "", regex=False)   # compact addr
+    tokens_v = names_v.str.split()
 
-    # Key A: country|name_compact[:8]  (long enough to avoid huge buckets)
+    # Key A: country|name_compact[:8]
     key_a = (ctry_v + "|" + nc.str[:8]).tolist()
 
-    # Key B: country|addr_compact[:8]
-    key_b = (ctry_v + "|" + ac.str[:8]).tolist()
+    # Key B: country|first_significant_token
+    first_tokens = tokens_v.apply(lambda t: t[0] if isinstance(t, list) and len(t) > 0 and len(t[0]) >= 3 else "")
+    key_b = (ctry_v + "|first_" + first_tokens).tolist()
 
-    # Key C: name_compact[:10]  (handles cross-country same-name)
-    key_c = nc.str[:10].tolist()
+    # Key C: country|sorted_tokens[:3]
+    sorted_tokens = tokens_v.apply(lambda t: " ".join(sorted(t[:3])) if isinstance(t, list) and len(t) >= 2 else "")
+    key_c = (ctry_v + "|sorted_" + sorted_tokens).tolist()
 
-    # Key D: sorted name tokens (handles word-order transpositions)
-    #   After legal strip: "Sarasva India" and "limited Sarasva India" both → "india sarasva"
-    key_d = names_v.str.split().apply(
-        lambda t: " ".join(sorted(t)[:5]) if isinstance(t, list) and t else ""
-    ).tolist()
+    # Key D: country|house_number|street_word
+    house_nums = addrs_v.str.extract(r"\b(\d{1,6})\b")[0].fillna("")
+    street_words = addrs_v.str.extract(r"\b([a-z]{4,})\b")[0].fillna("")
+    has_street_anchor = (house_nums != "") & (street_words != "")
+    key_d = np.where(has_street_anchor, ctry_v + "|" + house_nums + "|" + street_words, "").tolist()
 
-    # Key E: name_compact[:6]|addr_compact[:6] (combined discriminator)
-    key_e = (nc.str[:6] + "|" + ac.str[:6]).tolist()
+    # Key E: country|postal_code (5 or 6 digits)
+    pins = addrs_v.str.extract(r"\b(\d{5,6})\b")[0].fillna("")
+    key_e = np.where(pins != "", ctry_v + "|pin_" + pins, "").tolist()
 
-    # Key F: name_compact[:5]|country (short name + country, catches abbreviations)
-    key_f = (nc.str[:5] + "|" + ctry_v).tolist()
+    # Key F: country|name_compact[:5] (fallback for short acronyms)
+    key_f = (ctry_v + "|" + nc.str[:5]).tolist()
 
     return key_a, key_b, key_c, key_d, key_e, key_f
 

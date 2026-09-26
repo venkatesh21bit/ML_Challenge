@@ -38,14 +38,13 @@ def query_tfidf_batch(
     mat: sp.csr_matrix,
     entity_ids: List[str],
     top_k: int = 30,
-    batch_size: int = 32,
+    batch_size: int = 256,
+    min_similarity: float = 0.12,
 ) -> List[List[str]]:
     """
     Retrieve top-k candidates for a batch of query texts.
     Returns list of lists of entity_ids.
     Uses sparse-sparse matrix multiplication without converting to dense arrays.
-    mat.T is already a CSC matrix sharing the same data buffers (0 extra memory).
-    Small batch_size (32) keeps intermediate product matrix small and fast.
     """
     q_mat = vec.transform(query_texts)   # (Q, V) in CSR format
     n_queries = q_mat.shape[0]
@@ -68,7 +67,16 @@ def query_tfidf_batch(
 
             if len(row_data) == 0:
                 results.append([])
-            elif len(row_data) <= top_k:
+                continue
+
+            # Fast threshold filter to remove low-similarity noise
+            if min_similarity > 0 and len(row_data) > top_k:
+                mask = row_data >= min_similarity
+                if np.any(mask):
+                    row_indices = row_indices[mask]
+                    row_data = row_data[mask]
+
+            if len(row_data) <= top_k:
                 top_order = np.argsort(-row_data)
                 results.append([entity_ids[row_indices[i]] for i in top_order])
             else:
@@ -139,10 +147,11 @@ def run_tfidf_blocking(
     s_other: pd.DataFrame,
     top_k_name: int = 30,
     top_k_nameaddr: int = 40,
-    ngram_range: tuple = (3, 5),
-    max_features: int = 100_000,
-    max_df: float = 0.8,
-    batch_size: int = 32,
+    ngram_range: tuple = (3, 4),
+    max_features: int = 50_000,
+    max_df: float = 0.05,
+    min_df: int = 3,
+    batch_size: int = 256,
     verbose: bool = True,
 ) -> Dict[str, Set[str]]:
     """
@@ -154,6 +163,10 @@ def run_tfidf_blocking(
     db_eids = s_other["entity_id"].tolist()
     s1_eids = s1["entity_id"].tolist()
 
+    # Guardrail for small samples so max_df >= min_df / n_docs
+    n_docs = max(1, len(s_other))
+    effective_max_df = max(max_df, min(0.99, (min_df + 1) / n_docs))
+
     # ── Phase 1: Name-only TF-IDF index & query ─────────────────────────────
     if verbose:
         print(f"  [TF-IDF Phase 1] Building name index for {len(s_other):,} docs...")
@@ -164,9 +177,9 @@ def run_tfidf_blocking(
         analyzer=_make_analyzer(),
         ngram_range=ngram_range,
         max_features=max_features,
-        max_df=max_df,
+        max_df=effective_max_df,
         sublinear_tf=True,
-        min_df=2,
+        min_df=min_df,
         dtype=np.float32,
     )
     mat_name = vec_name.fit_transform(corpus_name)
@@ -204,9 +217,9 @@ def run_tfidf_blocking(
         analyzer=_make_analyzer(),
         ngram_range=ngram_range,
         max_features=max_features,
-        max_df=max_df,
+        max_df=effective_max_df,
         sublinear_tf=True,
-        min_df=2,
+        min_df=min_df,
         dtype=np.float32,
     )
     mat_nameaddr = vec_nameaddr.fit_transform(corpus_nameaddr)

@@ -10,17 +10,23 @@ import unicodedata
 from typing import Optional
 
 
-# ── Legal suffix patterns (English + common Indian/French variants) ──────────
+# ── Honorific / generic business prefix patterns ────────────────────────────
+_HONORIFIC_PREFIXES = re.compile(
+    r"^(shri|sri|shree|m/s|ms|dr|doctor|prof|the)\b\s*",
+    re.IGNORECASE,
+)
+
+# ── Legal suffix patterns (English + common Indian/French/US variants) ──────
 _LEGAL_SUFFIXES = re.compile(
     r"\b("
     r"pvt\.?\s*ltd\.?|private\s+limited|private\s+ltd\.?|"
-    r"p\.?\s*ltd\.?|llp|llc|inc\.?|corp\.?|corporation|"
+    r"p\.?\s*ltd\.?|llp|llc|inc\.?|corp\.?|corporation|incorporated|"
     r"limited|ltd\.?|co\.?|company|enterprises?|"
     r"industries|industry|group|holding|holdings|"
     r"trading|traders?|distributors?|solutions?|"
     r"technologies|technology|tech|services?|"
-    r"international|intl\.?|"
-    r"s\.a\.s|s\.a\.|sarl|sas|eurl|srl|"          # French legal
+    r"international|intl\.?|plc|gmbh|"
+    r"s\.a\.s|s\.a\.|sarl|sas|eurl|srl|"          # French / EU legal
     r"proprietorship|proprietor|prop\.?|"
     r"& sons|and sons|brothers|bros\.?"
     r")\b",
@@ -33,30 +39,41 @@ _MULTI_SPACE = re.compile(r"\s+")
 
 # Common abbreviation expansions (applied before normalization)
 _ABBREV_MAP = {
+    r"\bct\.?\b": "court",
     r"\brd\.?\b": "road",
     r"\bst\.?\b": "street",
-    r"\bave\.?\b": "avenue",
+    r"\bdr\.?\b": "drive",
+    r"\bpl\.?\b": "place",
+    r"\bave\.?\b|\bav\.?\b": "avenue",
     r"\bblvd\.?\b": "boulevard",
-    r"\bnagar\b": "nagar",
-    r"\bng\.?\b": "nagar",
-    r"\bmg\b": "mahatma gandhi",
-    r"\bdr\.?\b": "doctor",
+    r"\bln\.?\b": "lane",
+    r"\bcir\.?\b": "circle",
+    r"\bpkwy\.?\b": "parkway",
+    r"\bhwy\.?\b": "highway",
+    r"\bflr\.?\b|\bfl\.?\b": "floor",
+    r"\bapt\.?\b": "apartment",
+    r"\bste\.?\b": "suite",
+    r"\bbldg\.?\b": "building",
+    r"\bh\.?\s*no\.?\b": "house number",
+    r"\bplot\.?\s*no\.?\b": "plot number",
+    r"\bflat\.?\s*no\.?\b": "flat",
+    r"\bnagar\b|\bng\.?\b": "nagar",
+    r"\bm\.?\s*g\.?\b": "mahatma gandhi",
     r"\&": "and",
-    r"\bno\.?\b": "number",
-    r"\bnos\.?\b": "number",
+    r"\bno\.?\b|\bnos\.?\b": "number",
 }
 _ABBREV_PATTERNS = [(re.compile(p, re.IGNORECASE), r) for p, r in _ABBREV_MAP.items()]
 
 
 def unicode_normalize(text: str) -> str:
-    """NFD-normalize and strip diacritics (handles accented chars for French)."""
-    return unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode("ascii")
+    """NFKD-normalize and strip diacritics / non-ascii characters cleanly."""
+    return unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode("ascii")
 
 
 def normalize_text(text: str, expand_abbrevs: bool = False) -> str:
     """
     Core normalization pipeline:
-      1. Unicode → ASCII
+      1. Unicode / encoding artifact cleanup → ASCII
       2. Lowercase
       3. Optional abbreviation expansion
       4. Remove punctuation
@@ -75,10 +92,11 @@ def normalize_text(text: str, expand_abbrevs: bool = False) -> str:
 
 
 def normalize_name(name: str) -> str:
-    """Normalize business name: keep abbreviation, remove legal suffix."""
+    """Normalize business name: strip honorifics, strip legal suffixes."""
     if not isinstance(name, str):
         return ""
     n = normalize_text(name)
+    n = _HONORIFIC_PREFIXES.sub("", n)
     n = _LEGAL_SUFFIXES.sub(" ", n)
     n = _MULTI_SPACE.sub(" ", n).strip()
     return n

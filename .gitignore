@@ -41,13 +41,22 @@ ENV/
 # Challenge data & model weights (uncomment or modify as needed)
 datasets/*
 !datasets/.gitkeep
-pretrained_models/*/*
-!pretrained_models/*/.gitkeep
+# Large model weights, datasets and archives
+*.zip
+*.tar
+*.tar.gz
+*.cbm
+*.safetensors
+*.bin
+*.pth
+*.pt
+*.parquet
+*.npy
+
+models/
+models*/
+pretrained_models/
 outputs/*
 !outputs/.gitkeep
 cache/*
 !cache/.gitkeep
-
-# OS generated files
-.DS_Store
-Thumbs.db

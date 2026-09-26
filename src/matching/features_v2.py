@@ -61,6 +61,13 @@ def token_overlap(a: str, b: str) -> float:
     return len(sa & sb) / min(len(sa), len(sb))
 
 
+try:
+    from rapidfuzz.distance import Levenshtein as _rf_lev
+    _HAS_RF_LEV = True
+except ImportError:
+    _HAS_RF_LEV = False
+
+
 def levenshtein(a: str, b: str) -> int:
     a, b = a[:80], b[:80]
     if len(a) < len(b):
@@ -79,6 +86,8 @@ def levenshtein(a: str, b: str) -> int:
 def normalized_edit(a: str, b: str) -> float:
     if not a and not b:
         return 0.0
+    if _HAS_RF_LEV:
+        return float(_rf_lev.normalized_distance(a, b))
     return levenshtein(a, b) / max(len(a), len(b), 1)
 
 

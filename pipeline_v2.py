@@ -96,7 +96,7 @@ def block_one_source(
     s1, s_other, source_label,
     top_k_name=30, top_k_addr=40, sn_window=10,
     max_candidates=150, use_dense=False, top_k_dense=30,
-    faiss_cache_path=None,
+    faiss_cache_path=None, skip_tfidf=False,
 ):
     print(f"\n{'='*50}\nBLOCKING: S1 → {source_label}\n{'='*50}")
     layers = []
@@ -106,11 +106,12 @@ def block_one_source(
     print(f"  Deterministic done in {time.time()-t:.1f}s")
     layers.append(det)
 
-    t = time.time()
-    tfidf = run_tfidf_blocking(s1, s_other, top_k_name=top_k_name,
-                                top_k_nameaddr=top_k_addr, verbose=True)
-    print(f"  TF-IDF done in {time.time()-t:.1f}s")
-    layers.append(tfidf)
+    if not skip_tfidf and not (top_k_name == 0 and top_k_addr == 0):
+        t = time.time()
+        tfidf = run_tfidf_blocking(s1, s_other, top_k_name=top_k_name,
+                                    top_k_nameaddr=top_k_addr, verbose=True)
+        print(f"  TF-IDF done in {time.time()-t:.1f}s")
+        layers.append(tfidf)
 
     t = time.time()
     sn = run_sorted_neighbourhood(s1, s_other, window_size=sn_window, verbose=True)
@@ -425,6 +426,7 @@ def run_block_only(args):
         sn_window=args.sn_window,
         output_csv="reports/blocking_benchmark.csv",
         skip_dense=not args.use_dense,
+        skip_tfidf=args.skip_tfidf,
     )
 
 
@@ -523,6 +525,7 @@ def _block_kwargs(args):
         max_candidates=args.max_candidates,
         use_dense=args.use_dense,
         top_k_dense=args.top_k_dense,
+        skip_tfidf=args.skip_tfidf,
     )
 
 
@@ -552,6 +555,8 @@ if __name__ == "__main__":
                         help="Force re-running blocking even if cached")
 
     # Blocking
+    parser.add_argument("--skip-tfidf",    action="store_true",
+                        help="Skip slow 5M TF-IDF fitting (use deterministic + sorted neighbourhood)")
     parser.add_argument("--top-k-name",    type=int,   default=30)
     parser.add_argument("--top-k-addr",    type=int,   default=40)
     parser.add_argument("--sn-window",     type=int,   default=10)

@@ -115,6 +115,7 @@ def run_benchmark(
     sn_window: int = 10,
     output_csv: str = "reports/blocking_benchmark.csv",
     skip_dense: bool = True,   # skip dense by default (slow at 5M scale without GPU)
+    skip_tfidf: bool = False,  # skip slow 5M TF-IDF fitting
     seed: int = 42,
 ):
     import gc
@@ -163,28 +164,31 @@ def run_benchmark(
     results.append(benchmark_single_pass("deterministic_union", det_union, gt_val, 0))
 
     # ── Layer 2: TF-IDF ──────────────────────────────────────────────────────
-    print("\n[5] Running TF-IDF blocking (S1 → S2)...")
-    t = time.time()
-    tfidf_s2 = run_tfidf_blocking(
-        s1_val, s2,
-        top_k_name=top_k_tfidf_name,
-        top_k_nameaddr=top_k_tfidf_nameaddr,
-        verbose=True,
-    )
-    results.append(benchmark_single_pass("tfidf_s2", tfidf_s2, gt_val, time.time() - t))
+    if not skip_tfidf:
+        print("\n[5] Running TF-IDF blocking (S1 → S2)...")
+        t = time.time()
+        tfidf_s2 = run_tfidf_blocking(
+            s1_val, s2,
+            top_k_name=top_k_tfidf_name,
+            top_k_nameaddr=top_k_tfidf_nameaddr,
+            verbose=True,
+        )
+        results.append(benchmark_single_pass("tfidf_s2", tfidf_s2, gt_val, time.time() - t))
 
-    print("\n[6] Running TF-IDF blocking (S1 → S3)...")
-    t = time.time()
-    tfidf_s3 = run_tfidf_blocking(
-        s1_val, s3,
-        top_k_name=top_k_tfidf_name,
-        top_k_nameaddr=top_k_tfidf_nameaddr,
-        verbose=True,
-    )
-    results.append(benchmark_single_pass("tfidf_s3", tfidf_s3, gt_val, time.time() - t))
+        print("\n[6] Running TF-IDF blocking (S1 → S3)...")
+        t = time.time()
+        tfidf_s3 = run_tfidf_blocking(
+            s1_val, s3,
+            top_k_name=top_k_tfidf_name,
+            top_k_nameaddr=top_k_tfidf_nameaddr,
+            verbose=True,
+        )
+        results.append(benchmark_single_pass("tfidf_s3", tfidf_s3, gt_val, time.time() - t))
 
-    tfidf_union = union_candidates(tfidf_s2, tfidf_s3)
-    results.append(benchmark_single_pass("tfidf_union", tfidf_union, gt_val, 0))
+        tfidf_union = union_candidates(tfidf_s2, tfidf_s3)
+        results.append(benchmark_single_pass("tfidf_union", tfidf_union, gt_val, 0))
+    else:
+        tfidf_s2, tfidf_s3 = {}, {}
 
     # ── Layer 4: Sorted Neighbourhood ────────────────────────────────────────
     print("\n[7] Running SORTED NEIGHBOURHOOD (S1 → S2)...")
@@ -212,7 +216,9 @@ def run_benchmark(
 
     # ── FINAL UNION ──────────────────────────────────────────────────────────
     print("\n[UNION] Computing UNION of all methods...")
-    all_dicts = [det_s2, det_s3, tfidf_s2, tfidf_s3, sn_s2, sn_s3]
+    all_dicts = [det_s2, det_s3, sn_s2, sn_s3]
+    if not skip_tfidf:
+        all_dicts += [tfidf_s2, tfidf_s3]
     if not skip_dense:
         all_dicts += [dense_s2, dense_s3]
 
