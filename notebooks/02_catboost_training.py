@@ -618,18 +618,26 @@ print(f"\nFeatures with Zero Importance: {len(zero_feats)} / {len(FEATURE_NAMES_
 # ════════════════════════════════════════════════════════════
 """
 import gc
+import os
+import sys
+import numpy as np
+import polars as pl
+from tqdm import tqdm
+from scipy.special import expit
+from src.matching.features_v4 import compute_pair_features_v4
 
 print("=" * 65)
-print("STAGE 9: MEMORY-SAFE TEST SUBMISSION & VALIDATION")
+print("STAGE 9: FULL CATBOOST GPU BATCH INFERENCE ON TEST SET")
 print("=" * 65)
 
-# 1. Aggressive Garbage Collection of heavy training matrices
-print("Clearing training cache from RAM...")
+# 1. Clean RAM from training stage
+print("Reclaiming RAM from training stage...")
 for k in ["X_all", "y_all", "weights_all", "folds_all", "enriched_df", "train_pairs_df", "labeled_cands"]:
     if k in globals():
         del globals()[k]
 gc.collect()
 
+# 2. Locate paths
 possible_test_cands = [
     "/content/drive/MyDrive/Amazon_ML_Dataset/cand_test.parquet",
     "/kaggle/input/cadidate_ml_amazon/cand_test.parquet",
@@ -640,59 +648,163 @@ possible_test_cands = [
 ]
 test_cand_p = next((p for p in possible_test_cands if os.path.exists(p)), possible_test_cands[0])
 
-possible_test_s1 = [
-    "/content/drive/MyDrive/Amazon_ML_Dataset/test_source1.tsv",
-    f"{os.path.dirname(train_dir)}/test/test_source1.tsv",
-    "dataset/student_resource/dataset/test/test_source1.tsv",
-    "datasets/6ab10eb3b23ba_student_resource/student_resource/dataset/test/test_source1.tsv",
-    "/kaggle/input/amazon-ml-challenge-2026/6ab10eb3b23ba_student_resource/student_resource/dataset/test/test_source1.tsv",
+possible_train_dirs = [
+    "/content/drive/MyDrive/Amazon_ML_Dataset",
+    "/kaggle/input/amazon-ml-challenge-2026/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
+    "/kaggle/input/datasets/venkatesh21bit/amazon-ml-challenge-2026/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
+    "/kaggle/input/amazon-ml-challenge-2026/student_resource/dataset/train",
+    "dataset/student_resource/dataset/train",
+    "datasets/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
 ]
-test_s1_p = next((p for p in possible_test_s1 if os.path.exists(p)), possible_test_s1[0])
+t_dir = next((d for d in possible_train_dirs if os.path.exists(d)), possible_train_dirs[0])
+test_dir = os.path.join(os.path.dirname(t_dir), "test") if "train" in t_dir else t_dir
+
+test_s1_p = os.path.join(test_dir, "test_source1.tsv")
+test_s2_p = os.path.join(test_dir, "test_source2.tsv")
+test_s3_p = os.path.join(test_dir, "test_source3.tsv")
 
 out_tsv = "outputs/matching_results.tsv"
 os.makedirs("outputs", exist_ok=True)
 
-test_s1_all = pl.read_csv(test_s1_p, separator="\t").select(["entity_id"]).rename({"entity_id": "source1_entity_id"})
-print(f"Total Test S1 Entities: {len(test_s1_all):,}")
+# 3. Load text metadata
+print("Loading test metadata text for feature enrichment...")
+test_s1_df = pl.read_csv(test_s1_p, separator="\t").select(["entity_id", "business_name", "business_address", "country"])
+s2_df = pl.read_csv(test_s2_p, separator="\t").select(["entity_id", "business_name", "business_address", "country"])
+s3_df = pl.read_csv(test_s3_p, separator="\t").select(["entity_id", "business_name", "business_address", "country"])
+test_so_df = pl.concat([s2_df, s3_df])
+del s2_df, s3_df
+gc.collect()
 
-# 2. Vectorized Streaming in Polars with Parquet Predicate Pushdown (Takes < 4s, < 500MB RAM)
-thresh = best_t if 'best_t' in globals() else 0.65
-min_sim = float(thresh * 100.0)
-print(f"Streaming test candidates from {test_cand_p} at threshold t* = {thresh:.2f} (similarity >= {min_sim:.1f})...")
-
-test_cand_scored = (
+# 4. Filter top candidate pairs per S1 entity (covers 97% of true matches)
+print(f"Filtering top candidate pairs from {test_cand_p}...")
+test_cands = (
     pl.scan_parquet(test_cand_p)
-    .filter((pl.col("slot") < 3) & ((pl.col("sn") + pl.col("sa")) >= min_sim))
-    .with_columns(
-        ((pl.col("sn").fill_null(0.0) + pl.col("sa").fill_null(0.0)) / 100.0).alias("score")
-    )
-    .sort("score", descending=True)
-    .unique(subset=["o"], keep="first")  # Enforce 1-to-1 matching constraint (each o claimed at most once)
+    .filter((pl.col("sn") + pl.col("sa")) >= 40.0)
+    .select(["s1", "o", "sn", "sa", "slot"])
+    .sort(pl.col("sn") + pl.col("sa"), descending=True)
     .group_by("s1")
-    .agg(pl.col("o").sort().str.join(","))
-    .rename({"s1": "source1_entity_id", "o": "matched_entity_ids"})
+    .head(2)
     .collect()
 )
+n_cands = len(test_cands)
+print(f"Top Candidate Pairs to Score with CatBoost: {n_cands:,}")
 
-# 3. Join with all test S1 entities to guarantee 100% S1 presence
+# 5. Load trained CatBoost model(s)
+if "clf_model" not in globals() or clf_model is None:
+    from catboost import CatBoostClassifier
+    model_paths = [
+        f"pretrained_models/catboost_v4_fold{k}.cbm" for k in range(5) if os.path.exists(f"pretrained_models/catboost_v4_fold{k}.cbm")
+    ]
+    if not model_paths and os.path.exists("pretrained_models/catboost_v4_classifier.cbm"):
+        model_paths = ["pretrained_models/catboost_v4_classifier.cbm"]
+    
+    scoring_models = []
+    for mp in model_paths:
+        m = CatBoostClassifier()
+        m.load_model(mp)
+        scoring_models.append(m)
+    print(f"Loaded {len(scoring_models)} CatBoost model(s) for ensembled inference.")
+else:
+    scoring_models = [clf_model] if "models_cls" not in globals() else models_cls
+    print(f"Using {len(scoring_models)} model(s) currently in memory.")
+
+# Calibration temperature and threshold
+T_val = T_opt if "T_opt" in globals() else 0.50
+thresh = best_t if "best_t" in globals() else 0.50
+print(f"Operating Parameters: Calibration T* = {T_val:.3f}, Threshold t* = {thresh:.2f}")
+
+# 6. Chunked Batch Feature Extraction & GPU Inference
+batch_size = 200_000
+kept_edges = []
+
+print(f"\nRunning CatBoost GPU Inference in batches of {batch_size:,}...")
+for start_idx in range(0, n_cands, batch_size):
+    end_idx = min(start_idx + batch_size, n_cands)
+    chunk = test_cands.slice(start_idx, end_idx - start_idx)
+    
+    # Enrich chunk with text metadata
+    chunk_enriched = (
+        chunk.join(test_s1_df, left_on="s1", right_on="entity_id", how="left")
+        .rename({"business_name": "s1_name", "business_address": "s1_addr", "country": "s1_country"})
+        .join(test_so_df, left_on="o", right_on="entity_id", how="left")
+        .rename({"business_name": "o_name", "business_address": "o_addr", "country": "o_country"})
+        .to_pandas()
+    )
+    
+    n_chunk = len(chunk_enriched)
+    X_chunk = np.zeros((n_chunk, 150), dtype=np.float32)
+    
+    s1_names = chunk_enriched["s1_name"].fillna("").astype(str).tolist()
+    s1_addrs = chunk_enriched["s1_addr"].fillna("").astype(str).tolist()
+    s1_cntrs = chunk_enriched["s1_country"].fillna("").astype(str).tolist()
+    o_names = chunk_enriched["o_name"].fillna("").astype(str).tolist()
+    o_addrs = chunk_enriched["o_addr"].fillna("").astype(str).tolist()
+    o_cntrs = chunk_enriched["o_country"].fillna("").astype(str).tolist()
+    o_ids = chunk_enriched["o"].astype(str).tolist()
+    sn_c = chunk_enriched["sn"].fillna(0.0).to_numpy()
+    sa_c = chunk_enriched["sa"].fillna(0.0).to_numpy()
+    slot_c = chunk_enriched["slot"].fillna(0).to_numpy()
+    
+    for i in range(n_chunk):
+        r1 = {"business_name": s1_names[i], "business_address": s1_addrs[i], "country": s1_cntrs[i]}
+        r2 = {"business_name": o_names[i], "business_address": o_addrs[i], "country": o_cntrs[i], "entity_id": o_ids[i]}
+        ctx = {"sn": sn_c[i], "sa": sa_c[i], "slot": slot_c[i], "rank": slot_c[i], "top_sim": sn_c[i] + sa_c[i]}
+        X_chunk[i] = compute_pair_features_v4(r1, r2, context=ctx)
+    
+    # Score with CatBoost GPU model(s)
+    preds = np.mean([m.predict_proba(X_chunk)[:, 1] for m in scoring_models], axis=0)
+    
+    # Temperature scale probabilities
+    eps = 1e-7
+    p_c = np.clip(preds, eps, 1.0 - eps)
+    calibrated_preds = expit(np.log(p_c / (1.0 - p_c)) / T_val)
+    
+    # Keep only candidate edges >= threshold
+    mask_keep = (calibrated_preds >= thresh)
+    s1_kept = chunk_enriched["s1"].to_numpy()[mask_keep]
+    o_kept = chunk_enriched["o"].to_numpy()[mask_keep]
+    scores_kept = calibrated_preds[mask_keep]
+    
+    for s, o_val, sc in zip(s1_kept, o_kept, scores_kept):
+        kept_edges.append((s, o_val, float(sc)))
+        
+    print(f"  Processed {end_idx:,} / {n_cands:,} pairs -> {len(kept_edges):,} matches kept so far")
+    del chunk_enriched, X_chunk
+    gc.collect()
+
+print(f"\nInference complete! Total high-confidence matches: {len(kept_edges):,}")
+
+# 7. Strict 1-to-1 Bipartite Matching on 'o' and Grouping
+print("Enforcing 1-to-1 matching constraint and formatting submission...")
+if kept_edges:
+    edges_df = pl.DataFrame(kept_edges, schema=["s1", "o", "score"], orient="row")
+    best_matches = (
+        edges_df.sort("score", descending=True)
+        .unique(subset=["o"], keep="first")
+        .group_by("s1")
+        .agg(pl.col("o").sort().str.join(","))
+        .rename({"s1": "source1_entity_id", "o": "matched_entity_ids"})
+    )
+else:
+    best_matches = pl.DataFrame(schema={"source1_entity_id": pl.Utf8, "matched_entity_ids": pl.Utf8})
+
+test_s1_full = test_s1_df.select(["entity_id"]).rename({"entity_id": "source1_entity_id"})
 submission_df = (
-    test_s1_all.join(test_cand_scored, on="source1_entity_id", how="left")
+    test_s1_full.join(best_matches, on="source1_entity_id", how="left")
     .with_columns(pl.col("matched_entity_ids").fill_null(""))
 )
 
-# 4. Stream write directly to TSV without quotes (passes official validator formatting)
 submission_df.write_csv(out_tsv, separator="\t", quote_style="never", null_value="")
-print(f"Successfully saved submission TSV: {out_tsv} ({len(submission_df):,} rows)")
+print(f"Saved Official Submission TSV: {out_tsv} ({len(submission_df):,} rows)")
 
-# 5. Run Official Validator safely
+# 8. Run Official Validator safely
 possible_validators = [
-    f"{os.path.dirname(os.path.dirname(train_dir))}/utils/validate_submission.py",
     "/content/drive/MyDrive/Amazon_ML_Dataset/validate_submission.py",
+    f"{os.path.dirname(os.path.dirname(train_dir))}/utils/validate_submission.py",
     "dataset/student_resource/utils/validate_submission.py",
     "datasets/6ab10eb3b23ba_student_resource/student_resource/utils/validate_submission.py",
 ]
 val_script = next((p for p in possible_validators if os.path.exists(p)), None)
-test_dir = os.path.dirname(test_s1_p)
 
 if val_script and os.path.exists(val_script):
     print("\nRunning Official Competition Validator...")
