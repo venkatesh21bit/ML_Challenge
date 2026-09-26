@@ -252,6 +252,8 @@ class MultiSampleDropoutHead(nn.Module):
         self.classifier = nn.Linear(hidden_size, num_labels)
 
     def forward(self, features):
+        if self.classifier.weight.dtype != features.dtype:
+            features = features.to(self.classifier.weight.dtype)
         logits = torch.mean(
             torch.stack([self.classifier(drop(features)) for drop in self.dropouts], dim=0),
             dim=0
@@ -275,7 +277,7 @@ class FocalLossWithLabelSmoothing(nn.Module):
         p = torch.exp(log_p)
         focal_weight = torch.pow(1.0 - p, self.gamma)
         if self.alpha is not None:
-            alpha_weights = torch.tensor([1.0 - self.alpha, self.alpha], device=logits.device)
+            alpha_weights = torch.tensor([1.0 - self.alpha, self.alpha], dtype=logits.dtype, device=logits.device)
             focal_weight = focal_weight * alpha_weights.unsqueeze(0)
 
         loss = -torch.sum(smooth_targets * focal_weight * log_p, dim=-1)
@@ -341,10 +343,12 @@ print(f"Classifier Head:  Multi-Sample Dropout (5 parallel heads)")
 tokenizer = AutoTokenizer.from_pretrained(chosen_model)
 model = AutoModelForSequenceClassification.from_pretrained(chosen_model, num_labels=2, ignore_mismatched_sizes=True)
 
-# Attach multi-sample dropout classifier head if hidden_size exists
+# Attach multi-sample dropout classifier head matching model dtype and device
 if hasattr(model, "classifier") and hasattr(model.classifier, "in_features"):
     hidden_size = model.classifier.in_features
-    model.classifier = MultiSampleDropoutHead(hidden_size=hidden_size, num_labels=2)
+    head = MultiSampleDropoutHead(hidden_size=hidden_size, num_labels=2)
+    head.to(dtype=model.dtype, device=model.device)
+    model.classifier = head
 
 train_dataset = EntityPairDataset(train_pairs, train_labels, tokenizer=tokenizer, max_length=320)
 collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
@@ -361,7 +365,7 @@ training_args = TrainingArguments(
     learning_rate=1.5e-5 if "large" in chosen_model else 2e-5,
     warmup_steps=warmup_steps,
     weight_decay=0.01,
-    fp16=torch.cuda.is_available(),
+    fp16=False,  # DeBERTa-v3 is known to be unstable with fp16; fp32 runs stably on T4 VRAM
     logging_steps=50,
     save_strategy="epoch",
     report_to="none",
