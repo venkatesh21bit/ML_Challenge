@@ -333,7 +333,16 @@ print(f"Loss Objective:   Focal Loss (alpha=0.75, gamma=2.0) (Upgrade 4)")
 print(f"Hint Signals:     10-Feature Quantitative Signals (Upgrade 5)")
 
 tokenizer = AutoTokenizer.from_pretrained(chosen_model)
-model = AutoModelForSequenceClassification.from_pretrained(chosen_model, num_labels=2, ignore_mismatched_sizes=True)
+model = AutoModelForSequenceClassification.from_pretrained(
+    chosen_model,
+    num_labels=2,
+    torch_dtype=torch.float32,
+    ignore_mismatched_sizes=True,
+)
+# Enforce all base model parameters in float32 for PyTorch AMP GradScaler
+model = model.float()
+for param in model.parameters():
+    param.data = param.data.float()
 
 # Problem 3: Bulk Pre-Tokenization (GPU never waits for CPU tokenization)
 print(f"\nPre-tokenizing {len(train_texts_a):,} pairs in bulk (Rust multi-threaded)...")
@@ -361,7 +370,7 @@ class PreTokenizedDataset(torch.utils.data.Dataset):
 train_dataset = PreTokenizedDataset(tokenized_inputs, train_labels)
 collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
 
-# Multi-Sample Dropout Classifier Head (with dtype alignment)
+# Problem 7: Multi-Sample Dropout Classifier Head (with dtype alignment)
 class MultiSampleDropoutHead(nn.Module):
     def __init__(self, hidden_size: int, num_labels: int = 2, dropouts=(0.1, 0.15, 0.2, 0.25, 0.3)):
         super().__init__()
@@ -383,11 +392,16 @@ if hasattr(model, "classifier"):
         hidden_size = old_classifier.in_features
         head = MultiSampleDropoutHead(hidden_size=hidden_size, num_labels=2)
         if hasattr(old_classifier, "weight") and old_classifier.weight.shape == head.classifier.weight.shape:
-            head.classifier.weight.data.copy_(old_classifier.weight.data)
+            head.classifier.weight.data.copy_(old_classifier.weight.data.float())
             if hasattr(old_classifier, "bias") and old_classifier.bias is not None:
-                head.classifier.bias.data.copy_(old_classifier.bias.data)
-        head.to(dtype=model.dtype, device=model.device)
+                head.classifier.bias.data.copy_(old_classifier.bias.data.float())
+        head.float()
+        head.to(device=model.device)
         model.classifier = head
+
+# Guarantee all model parameters remain float32 master weights for AMP GradScaler (Problem 10)
+for param in model.parameters():
+    param.data = param.data.float()
 
 # Problem 4: Custom FocalTrainer with FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
 class FocalTrainer(Trainer):
@@ -404,8 +418,11 @@ class FocalTrainer(Trainer):
         self.gamma = gamma
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
+        labels = inputs.get("labels", None)
+        if labels is None:
+            labels = inputs.pop("labels")
+        model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
+        outputs = model(**model_inputs)
         logits = outputs.logits
         if logits.dim() == 2 and logits.shape[1] == 2:
             probs = torch.softmax(logits, dim=-1)
@@ -420,9 +437,10 @@ class FocalTrainer(Trainer):
             loss = -(alpha_t * torch.pow(1.0 - p_t, self.gamma) * torch.log(p_t.clamp(min=1e-7))).mean()
         return (loss, outputs) if return_outputs else loss
 
-batch_size = 8 if "large" in chosen_model else 16
+batch_size = 4 if "large" in chosen_model else 16
+accum_steps = 4 if "large" in chosen_model else 2
 num_epochs = 3
-total_steps = max(1, (len(train_dataset) // batch_size) * num_epochs)
+total_steps = max(1, (len(train_dataset) // (batch_size * accum_steps)) * num_epochs)
 warmup_steps = max(10, int(0.10 * total_steps))
 
 # Problem 10: Hardware Optimization for Kaggle L4 / T4 (Memory reduction ~35%)
@@ -445,7 +463,7 @@ training_args = TrainingArguments(
     fp16=use_fp16,
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
-    gradient_accumulation_steps=2,
+    gradient_accumulation_steps=accum_steps,
     logging_steps=50,
     save_strategy="epoch",
     report_to="none",
