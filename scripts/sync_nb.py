@@ -52,5 +52,6 @@ if __name__ == "__main__":
     if len(sys.argv) == 3:
         convert(sys.argv[1], sys.argv[2])
     else:
+        convert("notebooks/02_catboost_training.py", "notebooks/02_catboost_training.ipynb")
         convert("notebooks/02_hard_negative_mining_and_gpu_training.py", "notebooks/02_hard_negative_mining_and_gpu_training.ipynb")
         convert("notebooks/03_deberta_crossencoder.py", "notebooks/03_deberta_crossencoder.ipynb")
