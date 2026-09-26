@@ -462,10 +462,13 @@ def cluster_candidate_predictions(cand_scores_dict: dict, threshold: float = 0.5
                 edges.append((float(prob), s1, o))
     edges.sort(key=lambda x: x[0], reverse=True)
     assigned_o = set()
+    s1_sources = {s1: set() for s1 in cand_scores_dict.keys()}
     clusters = {s1: set() for s1 in cand_scores_dict.keys()}
     for prob, s1, o in edges:
-        if o not in assigned_o:
+        src = "S2" if str(o).startswith("S2") else ("S3" if str(o).startswith("S3") else "SO")
+        if o not in assigned_o and src not in s1_sources[s1]:
             assigned_o.add(o)
+            s1_sources[s1].add(src)
             clusters[s1].add(o)
     return clusters
 
@@ -836,9 +839,16 @@ print(f"\nInference complete! Total high-confidence matches: {len(kept_edges):,}
 print("Enforcing 1-to-1 matching constraint and formatting submission...")
 if kept_edges:
     edges_df = pl.DataFrame(kept_edges, schema=["s1", "o", "score"], orient="row")
+    edges_df = edges_df.with_columns(
+        pl.when(pl.col("o").str.starts_with("S2")).then(pl.lit("S2"))
+        .when(pl.col("o").str.starts_with("S3")).then(pl.lit("S3"))
+        .otherwise(pl.lit("SO"))
+        .alias("source")
+    )
     best_matches = (
         edges_df.sort("score", descending=True)
         .unique(subset=["o"], keep="first")
+        .unique(subset=["s1", "source"], keep="first")
         .group_by("s1")
         .agg(pl.col("o").sort().str.join(","))
         .rename({"s1": "source1_entity_id", "o": "matched_entity_ids"})
