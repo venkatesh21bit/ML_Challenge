@@ -283,7 +283,17 @@ class FocalLossWithLabelSmoothing(nn.Module):
 
 class CrossEncoderTrainer(Trainer):
     def __init__(self, *args, loss_fn=None, **kwargs):
-        super().__init__(*args, **kwargs)
+        # In transformers >= 4.46, 'tokenizer' is renamed to 'processing_class'
+        tok = kwargs.pop("tokenizer", None)
+        if tok is not None and "processing_class" not in kwargs:
+            try:
+                super().__init__(*args, processing_class=tok, **kwargs)
+            except TypeError:
+                super().__init__(*args, **kwargs)
+        else:
+            super().__init__(*args, **kwargs)
+
+        self.tokenizer = tok
         self.loss_fn = loss_fn or FocalLossWithLabelSmoothing(gamma=2.0, alpha=0.25, label_smoothing=0.05)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -339,12 +349,17 @@ if hasattr(model, "classifier") and hasattr(model.classifier, "in_features"):
 train_dataset = EntityPairDataset(train_pairs, train_labels, tokenizer=tokenizer, max_length=320)
 collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
 
+batch_size = 8 if "large" in chosen_model else 16
+num_epochs = 3
+total_steps = max(1, (len(train_dataset) // batch_size) * num_epochs)
+warmup_steps = max(10, int(0.10 * total_steps))
+
 training_args = TrainingArguments(
     output_dir=output_model_dir,
-    num_train_epochs=3,
-    per_device_train_batch_size=8 if "large" in chosen_model else 16,
+    num_train_epochs=num_epochs,
+    per_device_train_batch_size=batch_size,
     learning_rate=1.5e-5 if "large" in chosen_model else 2e-5,
-    warmup_ratio=0.1,
+    warmup_steps=warmup_steps,
     weight_decay=0.01,
     fp16=torch.cuda.is_available(),
     logging_steps=50,
@@ -356,7 +371,6 @@ trainer = CrossEncoderTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
-    tokenizer=tokenizer,
     data_collator=collator,
     loss_fn=FocalLossWithLabelSmoothing(gamma=2.0, alpha=0.25, label_smoothing=0.05),
 )
