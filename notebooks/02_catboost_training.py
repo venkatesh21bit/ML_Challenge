@@ -682,6 +682,7 @@ possible_train_dirs = [
     "datasets/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
 ]
 t_dir = next((d for d in possible_train_dirs if os.path.exists(d)), possible_train_dirs[0])
+train_dir = t_dir
 test_dir = os.path.join(os.path.dirname(t_dir), "test") if "train" in t_dir else t_dir
 
 test_s1_p = os.path.join(test_dir, "test_source1.tsv")
