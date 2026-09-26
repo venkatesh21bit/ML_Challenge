@@ -471,19 +471,32 @@ def cluster_candidate_predictions(cand_scores_dict: dict, threshold: float = 0.5
 
 # 1. Resolve validation pairs (s1, o) safely from any available source
 val_df = None
-if "enriched_df" in globals() and "val_mask" in globals():
+
+# If cache metadata exists, prioritize it as it directly matches X_all and folds_all
+if os.path.exists("cache/pairs_meta.parquet"):
+    meta_df = pl.read_parquet("cache/pairs_meta.parquet")
+    if "folds_all" in globals() and len(meta_df) == len(folds_all):
+        val_df = meta_df.to_pandas()[folds_all == 0][["s1", "o"]].reset_index(drop=True)
+    elif "val_mask" in globals() and len(meta_df) == len(val_mask):
+        val_df = meta_df.to_pandas()[val_mask][["s1", "o"]].reset_index(drop=True)
+    else:
+        val_df = meta_df.filter(pl.col("fold") == 0).select(["s1", "o"]).to_pandas().reset_index(drop=True)
+
+if val_df is None and "enriched_df" in globals() and "val_mask" in globals():
     val_df = enriched_df[val_mask][["s1", "o"]].copy().reset_index(drop=True)
-elif "train_pairs_df" in globals():
-    if hasattr(train_pairs_df, "filter"):
+elif val_df is None and "train_pairs_df" in globals():
+    if "folds_all" in globals() and len(train_pairs_df) == len(folds_all):
+        if hasattr(train_pairs_df, "to_pandas"):
+            val_df = train_pairs_df.to_pandas()[folds_all == 0][["s1", "o"]].reset_index(drop=True)
+        else:
+            val_df = train_pairs_df[folds_all == 0][["s1", "o"]].copy().reset_index(drop=True)
+    elif hasattr(train_pairs_df, "filter"):
         val_df = train_pairs_df.filter(pl.col("fold") == 0).select(["s1", "o"]).to_pandas().reset_index(drop=True)
     elif isinstance(train_pairs_df, pd.DataFrame):
         val_df = train_pairs_df[train_pairs_df["fold"] == 0][["s1", "o"]].copy().reset_index(drop=True)
-elif os.path.exists("cache/pairs_meta.parquet"):
-    meta_df = pl.read_parquet("cache/pairs_meta.parquet")
-    val_df = meta_df.filter(pl.col("fold") == 0).select(["s1", "o"]).to_pandas().reset_index(drop=True)
 
 if val_df is None:
-    raise RuntimeError("Could not find validation pairs! Please ensure Stage 2 ('train_pairs_df') or Stage 4 ('enriched_df') has been run.")
+    raise RuntimeError("Could not find validation pairs! Please ensure Stage 2 ('train_pairs_df') or Stage 4 ('cache/pairs_meta.parquet') exists.")
 
 # 2. Resolve ground truth if not in memory
 if "gt_raw" not in globals():
@@ -492,7 +505,6 @@ if "gt_raw" not in globals():
         "/kaggle/input/amazon-ml-challenge-2026/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
         "/kaggle/input/datasets/venkatesh21bit/amazon-ml-challenge-2026/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
         "/kaggle/input/amazon-ml-challenge-2026/student_resource/dataset/train",
-        "/kaggle/input/datasets/venkatesh21bit/amazon-ml-challenge-2026/student_resource/dataset/train",
         "dataset/student_resource/dataset/train",
         "datasets/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
         "/content/drive/MyDrive/Amazon_ML_Challenge/dataset/student_resource/dataset/train",
@@ -505,10 +517,23 @@ if "p_calibrated_val" not in globals() and os.path.exists("cache/cb_val_probs_v4
     p_calibrated_val = np.load("cache/cb_val_probs_v4.npy")
 
 if "p_cls_val" not in globals():
-    if "clf_model" in globals() and "X_val" in globals():
+    if "oof_cls_probs" in globals():
+        v_mask = (folds_all == 0) if "folds_all" in globals() else np.zeros(len(oof_cls_probs), dtype=bool)
+        p_cls_val = oof_cls_probs[v_mask]
+    elif "clf_model" in globals() and "X_val" in globals():
         p_cls_val = clf_model.predict_proba(X_val)[:, 1]
     elif "p_calibrated_val" in globals():
         p_cls_val = p_calibrated_val
+
+# 4. Synchronize exact lengths to guarantee zero ValueError mismatch
+if "p_cls_val" in globals() and val_df is not None:
+    target_len = min(len(val_df), len(p_cls_val))
+    if len(val_df) != len(p_cls_val):
+        print(f"Aligning validation pairs ({len(val_df):,} -> {target_len:,}) to prediction array...")
+        val_df = val_df.iloc[:target_len].copy().reset_index(drop=True)
+        p_cls_val = p_cls_val[:target_len]
+        if "p_calibrated_val" in globals():
+            p_calibrated_val = p_calibrated_val[:target_len]
 
 eval_candidates = []
 if "p_cls_val" in globals():
