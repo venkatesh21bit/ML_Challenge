@@ -323,97 +323,71 @@ print(f"Candidate pairs metadata saved: cache/pairs_meta.parquet")
 # CELL 5 — Train CatBoostClassifier & CatBoostRanker (Upgrade 2)
 # ════════════════════════════════════════════════════════════
 """
-from catboost import CatBoostClassifier, CatBoostRanker, Pool
+from catboost import CatBoostClassifier, Pool
+import torch
 
 print("=" * 65)
-print("STAGE 5: TRAINING DUAL CLASSIFIER + RANKER (UPGRADE 2 & 5)")
+print("STAGE 5: TRAINING 5-FOLD CATBOOST GPU ENSEMBLE (UPGRADE 2 & 5)")
 print("=" * 65)
 
-# Split Fold 0 for validation, Folds 1-4 for training
-train_mask = (folds_all != 0)
-val_mask = (folds_all == 0)
+n_folds = 5
+models_cls = []
+oof_cls_probs = np.zeros(len(X_all), dtype=np.float32)
 
-X_train, y_train, w_train = X_all[train_mask], y_all[train_mask], weights_all[train_mask]
-X_val, y_val, w_val = X_all[val_mask], y_all[val_mask], weights_all[val_mask]
+for fold in range(n_folds):
+    print(f"\n--- Training Fold {fold + 1} / {n_folds} ---")
+    train_mask = (folds_all != fold)
+    val_mask = (folds_all == fold)
 
-train_groups = groups_all[train_mask]
-val_groups = groups_all[val_mask]
+    X_train, y_train, w_train = X_all[train_mask], y_all[train_mask], weights_all[train_mask]
+    X_val, y_val = X_all[val_mask], y_all[val_mask]
 
-# Ensure group ids are sorted for CatBoostRanker
-sort_idx_trn = np.argsort(train_groups)
-X_train_sort, y_train_sort, w_train_sort, groups_train_sort = (
-    X_train[sort_idx_trn], y_train[sort_idx_trn], w_train[sort_idx_trn], train_groups[sort_idx_trn]
-)
+    pool_train_cls = Pool(X_train, y_train, weight=w_train)
+    pool_val_cls = Pool(X_val, y_val)
 
-sort_idx_val = np.argsort(val_groups)
-X_val_sort, y_val_sort, w_val_sort, groups_val_sort = (
-    X_val[sort_idx_val], y_val[sort_idx_val], w_val[sort_idx_val], val_groups[sort_idx_val]
-)
+    clf_model = CatBoostClassifier(
+        iterations=2000,
+        learning_rate=0.04,
+        depth=7,
+        l2_leaf_reg=5.0,
+        border_count=128,
+        task_type="GPU" if torch.cuda.is_available() else "CPU",
+        loss_function="Logloss",
+        eval_metric="Logloss",
+        random_seed=42 + fold,
+        verbose=500,
+    )
+    clf_model.fit(pool_train_cls, eval_set=pool_val_cls, early_stopping_rounds=150, use_best_model=True)
+    
+    # Predict Out-Of-Fold probabilities
+    p_fold_val = clf_model.predict_proba(X_val)[:, 1]
+    oof_cls_probs[val_mask] = p_fold_val
+    
+    # Save model checkpoint
+    model_save_path = f"pretrained_models/catboost_v4_fold{fold}.cbm"
+    clf_model.save_model(model_save_path)
+    print(f"Saved: {model_save_path} (best iteration: {clf_model.get_best_iteration()})")
+    models_cls.append(clf_model)
 
-pool_train_cls = Pool(X_train, y_train, weight=w_train)
-pool_val_cls = Pool(X_val, y_val)
-
-pool_train_rank = Pool(X_train_sort, y_train_sort, group_id=groups_train_sort, weight=w_train_sort)
-pool_val_rank = Pool(X_val_sort, y_val_sort, group_id=groups_val_sort)
-
-# 1. Train Model A: CatBoostClassifier (Logloss)
-print("\n--- Training Model A: CatBoostClassifier (GPU, 150 Features) ---")
-clf_model = CatBoostClassifier(
-    iterations=2500,
-    learning_rate=0.03,
-    depth=7,
-    l2_leaf_reg=5.0,
-    border_count=128,
-    task_type="GPU" if torch.cuda.is_available() else "CPU",
-    loss_function="Logloss",
-    eval_metric="Logloss",
-    random_seed=42,
-    verbose=250,
-)
-clf_model.fit(pool_train_cls, eval_set=pool_val_cls, early_stopping_rounds=150, use_best_model=True)
-clf_model.save_model("pretrained_models/catboost_v4_classifier.cbm")
-print("Saved: pretrained_models/catboost_v4_classifier.cbm")
-
-# 2. Train Model B: CatBoostRanker (PairLogit)
-print("\n--- Training Model B: CatBoostRanker (GPU, PairLogit Ranking) ---")
-rank_model = CatBoostRanker(
-    iterations=2000,
-    learning_rate=0.03,
-    depth=6,
-    l2_leaf_reg=4.0,
-    task_type="GPU" if torch.cuda.is_available() else "CPU",
-    loss_function="PairLogit",
-    eval_metric="PairLogit",
-    random_seed=42,
-    verbose=250,
-)
-rank_model.fit(pool_train_rank, eval_set=pool_val_rank, early_stopping_rounds=150, use_best_model=True)
-rank_model.save_model("pretrained_models/catboost_v4_ranker.cbm")
-print("Saved: pretrained_models/catboost_v4_ranker.cbm")
+# Save overall OOF probabilities
+np.save("cache/oof_cls_probs_v4.npy", oof_cls_probs)
+print("\n" + "=" * 65)
+print("5-FOLD CROSS-VALIDATION TRAINING COMPLETE")
+print("=" * 65)
 """
 
 # ════════════════════════════════════════════════════════════
-# CELL 6 — Probability Calibration & Blending (Upgrade 6)
+# CELL 6 — Probability Calibration on Out-Of-Fold Predictions (Upgrade 6)
 # ════════════════════════════════════════════════════════════
 """
 from scipy.optimize import minimize
 from scipy.special import expit
 
 print("=" * 65)
-print("STAGE 6: PROBABILITY CALIBRATION & BLENDING (UPGRADE 6)")
+print("STAGE 6: PROBABILITY CALIBRATION ON 5-FOLD OOF PREDICTIONS (UPGRADE 6)")
 print("=" * 65)
 
-# Predict validation probabilities
-p_cls_val = clf_model.predict_proba(X_val)[:, 1]
-
-# Ranker outputs raw margin scores -> convert via sigmoid
-scores_rank_val = rank_model.predict(X_val)
-p_rank_val = expit(scores_rank_val)
-
-# Combine: 0.55 * Classifier + 0.45 * Ranker
-raw_blend_val = 0.55 * p_cls_val + 0.45 * p_rank_val
-
-# Temperature Calibration
+# Temperature Calibration on Out-Of-Fold predictions
 def fit_temperature(probs, labels):
     eps = 1e-7
     p_c = np.clip(probs, eps, 1.0 - eps)
@@ -426,8 +400,13 @@ def fit_temperature(probs, labels):
     res = minimize(nll, [1.0], bounds=[(0.05, 10.0)], method="L-BFGS-B")
     return float(res.x[0])
 
-T_opt = fit_temperature(raw_blend_val, y_val)
-p_calibrated_val = expit(np.log(np.clip(raw_blend_val, 1e-7, 1.0 - 1e-7) / (1.0 - np.clip(raw_blend_val, 1e-7, 1.0 - 1e-7))) / T_opt)
+T_opt = fit_temperature(oof_cls_probs, y_all)
+p_calibrated_oof = expit(np.log(np.clip(oof_cls_probs, 1e-7, 1.0 - 1e-7) / (1.0 - np.clip(oof_cls_probs, 1e-7, 1.0 - 1e-7))) / T_opt)
+
+# Validation fold (Fold 0) calibrated probabilities
+val_mask = (folds_all == 0)
+p_cls_val = oof_cls_probs[val_mask]
+p_calibrated_val = p_calibrated_oof[val_mask]
 
 print(f"Optimal Calibration Temperature T* = {T_opt:.3f}")
 np.save("cache/cb_val_probs_v4.npy", p_calibrated_val)
@@ -604,8 +583,12 @@ print("=" * 65)
 print("STAGE 8: TREE SHAP FEATURE IMPORTANCE ANALYSIS (UPGRADE 8)")
 print("=" * 65)
 
-# Compute feature importance directly from CatBoost
-importances = clf_model.get_feature_importance()
+# Compute feature importance averaged across 5 fold models
+if "models_cls" in globals() and models_cls:
+    importances = np.mean([m.get_feature_importance() for m in models_cls], axis=0)
+else:
+    importances = clf_model.get_feature_importance()
+
 feat_imp_df = pd.DataFrame({
     "feature": FEATURE_NAMES_V4,
     "importance": importances
