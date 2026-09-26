@@ -325,10 +325,21 @@ print(f"Candidate pairs metadata saved: cache/pairs_meta.parquet")
 """
 from catboost import CatBoostClassifier, Pool
 import torch
+import numpy as np
+import os
 
 print("=" * 65)
 print("STAGE 5: TRAINING 5-FOLD CATBOOST GPU ENSEMBLE (UPGRADE 2 & 5)")
 print("=" * 65)
+
+# Auto-reload cached feature matrix if kernel restarted
+if "X_all" not in globals() or X_all is None:
+    print("Loading cached feature matrix and labels from cache/ ...")
+    X_all = np.load("cache/X_all_150.npy")
+    y_all = np.load("cache/y_all_150.npy")
+    weights_all = np.load("cache/weights_all_150.npy")
+    folds_all = np.load("cache/folds_all_150.npy")
+    print(f"Successfully loaded: {X_all.shape} pairs across {len(np.unique(folds_all))} folds")
 
 n_folds = 5
 models_cls = []
