@@ -426,9 +426,54 @@ def cluster_candidate_predictions(cand_scores_dict: dict, threshold: float = 0.5
             clusters[s1].add(o)
     return clusters
 
-val_df = enriched_df[val_mask].copy()
-val_df["pred_prob_blend"] = p_calibrated_val
-val_df["pred_prob_cls"] = p_cls_val
+# 1. Resolve validation pairs (s1, o) safely from any available source
+val_df = None
+if "enriched_df" in globals() and "val_mask" in globals():
+    val_df = enriched_df[val_mask][["s1", "o"]].copy().reset_index(drop=True)
+elif "train_pairs_df" in globals():
+    if hasattr(train_pairs_df, "filter"):
+        val_df = train_pairs_df.filter(pl.col("fold") == 0).select(["s1", "o"]).to_pandas().reset_index(drop=True)
+    elif isinstance(train_pairs_df, pd.DataFrame):
+        val_df = train_pairs_df[train_pairs_df["fold"] == 0][["s1", "o"]].copy().reset_index(drop=True)
+elif os.path.exists("cache/pairs_meta.parquet"):
+    meta_df = pl.read_parquet("cache/pairs_meta.parquet")
+    val_df = meta_df.filter(pl.col("fold") == 0).select(["s1", "o"]).to_pandas().reset_index(drop=True)
+
+if val_df is None:
+    raise RuntimeError("Could not find validation pairs! Please ensure Stage 2 ('train_pairs_df') or Stage 4 ('enriched_df') has been run.")
+
+# 2. Resolve ground truth if not in memory
+if "gt_raw" not in globals():
+    possible_train_dirs = [
+        "/content/drive/MyDrive/Amazon_ML_Dataset",
+        "/kaggle/input/amazon-ml-challenge-2026/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
+        "/kaggle/input/datasets/venkatesh21bit/amazon-ml-challenge-2026/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
+        "/kaggle/input/amazon-ml-challenge-2026/student_resource/dataset/train",
+        "/kaggle/input/datasets/venkatesh21bit/amazon-ml-challenge-2026/student_resource/dataset/train",
+        "dataset/student_resource/dataset/train",
+        "datasets/6ab10eb3b23ba_student_resource/student_resource/dataset/train",
+        "/content/drive/MyDrive/Amazon_ML_Challenge/dataset/student_resource/dataset/train",
+    ]
+    t_dir = next((d for d in possible_train_dirs if os.path.exists(d)), possible_train_dirs[0])
+    gt_raw = pl.read_csv(f"{t_dir}/train_ground_truth.tsv", separator="\t")
+
+# 3. Resolve validation probabilities
+if "p_calibrated_val" not in globals() and os.path.exists("cache/cb_val_probs_v4.npy"):
+    p_calibrated_val = np.load("cache/cb_val_probs_v4.npy")
+
+if "p_cls_val" not in globals():
+    if "clf_model" in globals() and "X_val" in globals():
+        p_cls_val = clf_model.predict_proba(X_val)[:, 1]
+    elif "p_calibrated_val" in globals():
+        p_cls_val = p_calibrated_val
+
+eval_candidates = []
+if "p_cls_val" in globals():
+    val_df["pred_prob_cls"] = p_cls_val
+    eval_candidates.append(("CatBoostClassifier Standalone", "pred_prob_cls"))
+if "p_calibrated_val" in globals():
+    val_df["pred_prob_blend"] = p_calibrated_val
+    eval_candidates.append(("Dual Calibrated Blend", "pred_prob_blend"))
 
 val_s1_list = val_df["s1"].unique().tolist()
 val_gt_dict = {s1: set() for s1 in val_s1_list}
@@ -438,14 +483,14 @@ for row in gt_raw.filter(pl.col("source1_entity_id").is_in(val_s1_list)).iter_ro
     val_gt_dict[s1] = set(matches)
 
 # Evaluate both Classifier Alone and Dual Blend
-for name, prob_col in [("CatBoostClassifier Standalone", "pred_prob_cls"), ("Dual Calibrated Blend", "pred_prob_blend")]:
+for name, prob_col in eval_candidates:
     print(f"\n--- Sweeping Thresholds for {name} ---")
     val_cand_scores = defaultdict(list)
     for s1, o, prob in zip(val_df["s1"], val_df["o"], val_df[prob_col]):
         val_cand_scores[s1].append((o, float(prob)))
 
     best_score = 0.0
-    best_t = 0.50
+    best_t = 0.30
     for t in np.arange(0.10, 0.75, 0.05):
         t_round = round(t, 2)
         val_clusters = cluster_candidate_predictions(val_cand_scores, threshold=t_round)
