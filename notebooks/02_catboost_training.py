@@ -153,9 +153,14 @@ for fold, (_, val_idx) in enumerate(gkf.split(shuffled_s1, groups=shuffled_s1)):
     for eid in shuffled_s1[val_idx]:
         s1_fold_map[eid] = fold
 
-train_pairs_df = train_pairs_df.with_columns(
-    pl.col("s1").replace(s1_fold_map, default=0).alias("fold")
-)
+try:
+    train_pairs_df = train_pairs_df.with_columns(
+        pl.col("s1").replace_strict(s1_fold_map, default=0).alias("fold")
+    )
+except (AttributeError, TypeError):
+    train_pairs_df = train_pairs_df.with_columns(
+        pl.col("s1").replace(s1_fold_map, default=0).alias("fold")
+    )
 
 print(f"\n5-Fold GroupKFold Split Complete (Zero Entity Leakage):")
 for f in range(5):
@@ -422,7 +427,8 @@ def cluster_candidate_predictions(cand_scores_dict: dict, threshold: float = 0.5
     return clusters
 
 val_df = enriched_df[val_mask].copy()
-val_df["pred_prob"] = p_calibrated_val
+val_df["pred_prob_blend"] = p_calibrated_val
+val_df["pred_prob_cls"] = p_cls_val
 
 val_s1_list = val_df["s1"].unique().tolist()
 val_gt_dict = {s1: set() for s1 in val_s1_list}
@@ -431,25 +437,28 @@ for row in gt_raw.filter(pl.col("source1_entity_id").is_in(val_s1_list)).iter_ro
     matches = str(row["matched_entity_ids"]).split(",") if row["matched_entity_ids"] else []
     val_gt_dict[s1] = set(matches)
 
-val_cand_scores = defaultdict(list)
-for s1, o, prob in zip(val_df["s1"], val_df["o"], val_df["pred_prob"]):
-    val_cand_scores[s1].append((o, float(prob)))
+# Evaluate both Classifier Alone and Dual Blend
+for name, prob_col in [("CatBoostClassifier Standalone", "pred_prob_cls"), ("Dual Calibrated Blend", "pred_prob_blend")]:
+    print(f"\n--- Sweeping Thresholds for {name} ---")
+    val_cand_scores = defaultdict(list)
+    for s1, o, prob in zip(val_df["s1"], val_df["o"], val_df[prob_col]):
+        val_cand_scores[s1].append((o, float(prob)))
 
-best_macro_f05 = 0.0
-best_threshold = 0.75
+    best_score = 0.0
+    best_t = 0.50
+    for t in np.arange(0.10, 0.75, 0.05):
+        t_round = round(t, 2)
+        val_clusters = cluster_candidate_predictions(val_cand_scores, threshold=t_round)
+        score = compute_f05_macro(val_clusters, val_gt_dict)
+        print(f"Threshold t = {t_round:.2f} -> Macro F0.5: {score:.4f}")
+        if score > best_score:
+            best_score = score
+            best_t = t_round
 
-print("\n--- Sweeping Thresholds for Official Macro F0.5 ---")
-for t in np.arange(0.50, 0.95, 0.05):
-    t_round = round(t, 2)
-    val_clusters = cluster_candidate_predictions(val_cand_scores, threshold=t_round)
-    score = compute_f05_macro(val_clusters, val_gt_dict)
-    print(f"Threshold t = {t_round:.2f} -> Macro F0.5: {score:.4f}")
-    if score > best_macro_f05:
-        best_macro_f05 = score
-        best_threshold = t_round
+    print(f"--> {name} Best Macro F0.5: {best_score:.4f} at t* = {best_t:.2f}")
 
 print("=" * 65)
-print(f"CATBOOST V4 PEAK MACRO F0.5: {best_macro_f05:.4f} at t* = {best_threshold:.2f}")
+print(f"MACRO F0.5 OPTIMIZATION COMPLETE")
 print("=" * 65)
 """
 
