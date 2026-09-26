@@ -171,20 +171,87 @@ train_enriched = (
     .to_pandas()
 )
 
-train_pairs = list(zip(
+# ════════════════════════════════════════════════════════════
+# AIR #1 Structured Quantitative Hint Generator (Problem 5)
+# ════════════════════════════════════════════════════════════
+import re
+try:
+    from rapidfuzz.distance import JaroWinkler, Levenshtein
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
+
+pin_re = re.compile(r"\b\d{5,6}\b")
+num_re = re.compile(r"^\D*(\d+)")
+
+def make_hints(na: str, aa: str, ca: str, nb: str, ab: str, cb: str) -> str:
+    # 1. Zip match
+    pa, pb = pin_re.findall(aa), pin_re.findall(ab)
+    zip_m = 1 if (pa and pb and pa[0] == pb[0]) else 0
+
+    # 2. State / Country match
+    state_m = 1 if ca and cb and ca.lower().strip() == cb.lower().strip() else 0
+
+    # 3. House match
+    ha, hb = num_re.findall(aa), num_re.findall(ab)
+    house_m = 1 if (ha and hb and ha[0] == hb[0]) else 0
+
+    # 4. Prefix match (first 4 characters)
+    pref_m = 1 if na[:4].lower().strip() == nb[:4].lower().strip() and len(na) >= 4 else 0
+
+    # 5. Token overlap
+    sa, sb = set(na.lower().split()), set(nb.lower().split())
+    tok_ov = len(sa & sb) / max(len(sa | sb), 1)
+
+    # 6. Jaro & Levenshtein
+    if _HAS_RAPIDFUZZ:
+        jaro = JaroWinkler.similarity(na, nb)
+        lev = Levenshtein.normalized_similarity(na, nb)
+    else:
+        jaro = tok_ov
+        lev = tok_ov
+
+    # 7. Fast 3-gram char similarity (character TF-IDF approximation)
+    def char_ngrams(s, n=3):
+        return {s[i:i+n] for i in range(max(len(s) - n + 1, 0))}
+    nga, ngb = char_ngrams(na.lower()), char_ngrams(nb.lower())
+    n_tf = len(nga & ngb) / max(len(nga | ngb), 1)
+
+    aga, agb = char_ngrams(aa.lower()), char_ngrams(ab.lower())
+    a_tf = len(aga & agb) / max(len(aga | agb), 1)
+
+    # 8. City token match
+    city_m = 1 if (set(aa.lower().split()) & set(ab.lower().split())) else 0
+
+    return (
+        f"ZIP_MATCH={zip_m} CITY_MATCH={city_m} STATE_MATCH={state_m} "
+        f"NAME_TFIDF={n_tf:.3f} ADDRESS_TFIDF={a_tf:.3f} "
+        f"TOKEN_OVERLAP={tok_ov:.2f} JARO={jaro:.2f} LEVENSHTEIN={lev:.2f} "
+        f"HOUSE_MATCH={house_m} PREFIX_MATCH={pref_m}"
+    )
+
+print("Synthesizing structured prompts with AIR #1 quantitative hints...")
+train_texts_a = []
+train_texts_b = []
+
+for na, aa, ca, nb, ab, cb in zip(
     train_enriched["s1_name"].fillna("").astype(str),
     train_enriched["s1_addr"].fillna("").astype(str),
     train_enriched["s1_country"].fillna("").astype(str),
     train_enriched["o_name"].fillna("").astype(str),
     train_enriched["o_addr"].fillna("").astype(str),
     train_enriched["o_country"].fillna("").astype(str),
-))
+):
+    hints = make_hints(na, aa, ca, nb, ab, cb)
+    train_texts_a.append(f"[BUSINESS_A] {na} [ADDRESS_A] {aa} [COUNTRY_A] {ca}")
+    train_texts_b.append(f"[BUSINESS_B] {nb} [ADDRESS_B] {ab} [COUNTRY_B] {cb} [HINTS] {hints}")
+
 train_labels = train_enriched["label"].to_list()
 
-print("Sample Structured Pair for Cross-Encoder:")
-print(f"  [S1]   {train_pairs[0][0]} | {train_pairs[0][1]} | {train_pairs[0][2]}")
-print(f"  [Cand] {train_pairs[0][3]} | {train_pairs[0][4]} | {train_pairs[0][5]}")
-print(f"  Label: {train_labels[0]}")
+print("Sample Structured Pair with Expanded AIR #1 Hints:")
+print(f"  [Text A] {train_texts_a[0]}")
+print(f"  [Text B] {train_texts_b[0]}")
+print(f"  Label:   {train_labels[0]}")
 """
 
 # ════════════════════════════════════════════════════════════
@@ -196,117 +263,11 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, DataCollatorWithPadding
 
-# Self-contained Cross-Encoder Training & Architecture for Kaggle (Zero external src dependency)
-def format_structured_prompt(r1: dict, r2: dict, aux_hints: str = "") -> tuple:
-    name1 = str(r1.get("business_name", "")).strip() or "N/A"
-    addr1 = str(r1.get("business_address", "")).strip() or "N/A"
-    c1 = str(r1.get("country", "")).strip() or "N/A"
-    name2 = str(r2.get("business_name", "")).strip() or "N/A"
-    addr2 = str(r2.get("business_address", "")).strip() or "N/A"
-    c2 = str(r2.get("country", "")).strip() or "N/A"
-    text_a = f"[BUSINESS_A] {name1} [ADDRESS_A] {addr1} [COUNTRY_A] {c1}"
-    text_b = f"[BUSINESS_B] {name2} [ADDRESS_B] {addr2} [COUNTRY_B] {c2}"
-    if aux_hints:
-        text_b += f" [HINTS] {aux_hints.strip()}"
-    return text_a, text_b
+# Problem 1: Use microsoft/deberta-v3-large
+model_name = "microsoft/deberta-v3-large"
 
-class EntityPairDataset(torch.utils.data.Dataset):
-    def __init__(self, pairs, labels=None, tokenizer=None, max_length=320):
-        self.pairs = pairs
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, idx):
-        item = self.pairs[idx]
-        if isinstance(item, dict):
-            text_a, text_b = format_structured_prompt(item["r1"], item["r2"], item.get("hints", ""))
-        elif len(item) == 4:
-            r1 = {"business_name": item[0], "business_address": item[1], "country": ""}
-            r2 = {"business_name": item[2], "business_address": item[3], "country": ""}
-            text_a, text_b = format_structured_prompt(r1, r2)
-        elif len(item) >= 6:
-            r1 = {"business_name": item[0], "business_address": item[1], "country": item[2]}
-            r2 = {"business_name": item[3], "business_address": item[4], "country": item[5]}
-            text_a, text_b = format_structured_prompt(r1, r2)
-        else:
-            text_a, text_b = str(item[0]), str(item[1])
-
-        encoding = self.tokenizer(
-            text_a, text_b,
-            max_length=self.max_length,
-            truncation=True,
-            return_tensors=None,
-        )
-        if self.labels is not None:
-            encoding["labels"] = int(self.labels[idx])
-        return encoding
-
-class MultiSampleDropoutHead(nn.Module):
-    def __init__(self, hidden_size: int, num_labels: int = 2, dropouts=(0.1, 0.15, 0.2, 0.25, 0.3)):
-        super().__init__()
-        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropouts])
-        self.classifier = nn.Linear(hidden_size, num_labels)
-
-    def forward(self, features):
-        if self.classifier.weight.dtype != features.dtype:
-            features = features.to(self.classifier.weight.dtype)
-        logits = torch.mean(
-            torch.stack([self.classifier(drop(features)) for drop in self.dropouts], dim=0),
-            dim=0
-        )
-        return logits
-
-class FocalLossWithLabelSmoothing(nn.Module):
-    def __init__(self, gamma: float = 2.0, alpha: float = 0.25, label_smoothing: float = 0.05):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.label_smoothing = label_smoothing
-
-    def forward(self, logits, targets):
-        num_classes = logits.size(-1)
-        with torch.no_grad():
-            smooth_targets = torch.full_like(logits, fill_value=self.label_smoothing / (num_classes - 1))
-            smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
-
-        log_p = torch.log_softmax(logits, dim=-1)
-        p = torch.exp(log_p)
-        focal_weight = torch.pow(1.0 - p, self.gamma)
-        if self.alpha is not None:
-            alpha_weights = torch.tensor([1.0 - self.alpha, self.alpha], dtype=logits.dtype, device=logits.device)
-            focal_weight = focal_weight * alpha_weights.unsqueeze(0)
-
-        loss = -torch.sum(smooth_targets * focal_weight * log_p, dim=-1)
-        return loss.mean()
-
-class CrossEncoderTrainer(Trainer):
-    def __init__(self, *args, loss_fn=None, **kwargs):
-        # In transformers >= 4.46, 'tokenizer' is renamed to 'processing_class'
-        tok = kwargs.pop("tokenizer", None)
-        if tok is not None and "processing_class" not in kwargs:
-            try:
-                super().__init__(*args, processing_class=tok, **kwargs)
-            except TypeError:
-                super().__init__(*args, **kwargs)
-        else:
-            super().__init__(*args, **kwargs)
-
-        self.tokenizer = tok
-        self.loss_fn = loss_fn or FocalLossWithLabelSmoothing(gamma=2.0, alpha=0.25, label_smoothing=0.05)
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        labels = inputs.pop("labels", None) if "labels" in inputs else None
-        outputs = model(**inputs)
-        logits = outputs.logits
-        if labels is not None:
-            loss = self.loss_fn(logits, labels)
-        else:
-            loss = outputs.loss
-        return (loss, outputs) if return_outputs else loss
+# Problem 2: Increase token length to 384 for complete address preservation
+max_length = 384
 
 # Resolve Output directory across Kaggle & Local
 possible_output_dirs = [
@@ -325,33 +286,99 @@ possible_backbones = [
 found_backbone = next((p for p in possible_backbones if os.path.exists(p)), None)
 
 vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
-if found_backbone:
-    chosen_model = found_backbone
-    print(f"Using local pre-uploaded backbone checkpoint: {chosen_model}")
-else:
-    chosen_model = "microsoft/deberta-v3-large" if vram_gb >= 15.0 else "microsoft/deberta-v3-base"
-    print(f"Using HuggingFace pretrained backbone: {chosen_model}")
+chosen_model = model_name
 
 print("=" * 65)
 print(f"FINE-TUNING {chosen_model.upper()} (AIR #1 DEBERTA V4 ARCHITECTURE)")
 print("=" * 65)
+print(f"Model Backbone:   {chosen_model} (Upgrade 1)")
 print(f"Available VRAM:   {vram_gb:.2f} GB")
-print(f"Context Length:   320 tokens (Dynamic Padding Enabled)")
-print(f"Loss Objective:   Precision-Weighted Focal Loss (gamma=2.0, label_smoothing=0.05)")
-print(f"Classifier Head:  Multi-Sample Dropout (5 parallel heads)")
+print(f"Context Length:   {max_length} tokens with Dynamic Padding (Upgrade 2)")
+print(f"Dataset Pipeline: Bulk Pre-Tokenization (Upgrade 3)")
+print(f"Loss Objective:   Focal Loss (alpha=0.75, gamma=2.0) (Upgrade 4)")
+print(f"Hint Signals:     10-Feature Quantitative Signals (Upgrade 5)")
 
 tokenizer = AutoTokenizer.from_pretrained(chosen_model)
 model = AutoModelForSequenceClassification.from_pretrained(chosen_model, num_labels=2, ignore_mismatched_sizes=True)
 
-# Attach multi-sample dropout classifier head matching model dtype and device
+# Problem 3: Bulk Pre-Tokenization (GPU never waits for CPU tokenization)
+print(f"\nPre-tokenizing {len(train_texts_a):,} pairs in bulk (Rust multi-threaded)...")
+tokenized_inputs = tokenizer(
+    train_texts_a,
+    train_texts_b,
+    max_length=max_length,
+    truncation=True,
+    padding=False,
+)
+
+class PreTokenizedDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        item = {key: self.encodings[key][idx] for key in self.encodings}
+        item["labels"] = int(self.labels[idx])
+        return item
+
+train_dataset = PreTokenizedDataset(tokenized_inputs, train_labels)
+collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+
+# Multi-Sample Dropout Classifier Head (with dtype alignment)
+class MultiSampleDropoutHead(nn.Module):
+    def __init__(self, hidden_size: int, num_labels: int = 2, dropouts=(0.1, 0.15, 0.2, 0.25, 0.3)):
+        super().__init__()
+        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropouts])
+        self.classifier = nn.Linear(hidden_size, num_labels)
+
+    def forward(self, features):
+        if self.classifier.weight.dtype != features.dtype:
+            features = features.to(self.classifier.weight.dtype)
+        logits = torch.mean(
+            torch.stack([self.classifier(drop(features)) for drop in self.dropouts], dim=0),
+            dim=0
+        )
+        return logits
+
 if hasattr(model, "classifier") and hasattr(model.classifier, "in_features"):
     hidden_size = model.classifier.in_features
     head = MultiSampleDropoutHead(hidden_size=hidden_size, num_labels=2)
     head.to(dtype=model.dtype, device=model.device)
     model.classifier = head
 
-train_dataset = EntityPairDataset(train_pairs, train_labels, tokenizer=tokenizer, max_length=320)
-collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+# Problem 4: Custom FocalTrainer with FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
+class FocalTrainer(Trainer):
+    def __init__(self, *args, alpha=0.75, gamma=2.0, **kwargs):
+        tok = kwargs.pop("tokenizer", None)
+        if tok is not None and "processing_class" not in kwargs:
+            try:
+                super().__init__(*args, processing_class=tok, **kwargs)
+            except TypeError:
+                super().__init__(*args, **kwargs)
+        else:
+            super().__init__(*args, **kwargs)
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        if logits.dim() == 2 and logits.shape[1] == 2:
+            probs = torch.softmax(logits, dim=-1)
+            p_t = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+            alpha_t = torch.where(labels == 1, self.alpha, 1.0 - self.alpha)
+            loss = -(alpha_t * torch.pow(1.0 - p_t, self.gamma) * torch.log(p_t.clamp(min=1e-7))).mean()
+        else:
+            sig = torch.sigmoid(logits.view(-1))
+            labels_f = labels.float().view(-1)
+            p_t = torch.where(labels_f == 1.0, sig, 1.0 - sig)
+            alpha_t = torch.where(labels_f == 1.0, self.alpha, 1.0 - self.alpha)
+            loss = -(alpha_t * torch.pow(1.0 - p_t, self.gamma) * torch.log(p_t.clamp(min=1e-7))).mean()
+        return (loss, outputs) if return_outputs else loss
 
 batch_size = 8 if "large" in chosen_model else 16
 num_epochs = 3
@@ -365,18 +392,19 @@ training_args = TrainingArguments(
     learning_rate=1.5e-5 if "large" in chosen_model else 2e-5,
     warmup_steps=warmup_steps,
     weight_decay=0.01,
-    fp16=False,  # DeBERTa-v3 is known to be unstable with fp16; fp32 runs stably on T4 VRAM
+    fp16=False,
     logging_steps=50,
     save_strategy="epoch",
     report_to="none",
 )
 
-trainer = CrossEncoderTrainer(
+trainer = FocalTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
     data_collator=collator,
-    loss_fn=FocalLossWithLabelSmoothing(gamma=2.0, alpha=0.25, label_smoothing=0.05),
+    alpha=0.75,
+    gamma=2.0,
 )
 
 trainer.train()
@@ -395,59 +423,15 @@ import pandas as pd
 import numpy as np
 import torch
 from collections import defaultdict
+
 # 1. Self-contained Cross-Encoder helper definitions (Zero external src dependency)
-def format_structured_prompt(r1: dict, r2: dict, aux_hints: str = "") -> tuple:
-    name1 = str(r1.get("business_name", "")).strip() or "N/A"
-    addr1 = str(r1.get("business_address", "")).strip() or "N/A"
-    c1 = str(r1.get("country", "")).strip() or "N/A"
-    name2 = str(r2.get("business_name", "")).strip() or "N/A"
-    addr2 = str(r2.get("business_address", "")).strip() or "N/A"
-    c2 = str(r2.get("country", "")).strip() or "N/A"
-    text_a = f"[BUSINESS_A] {name1} [ADDRESS_A] {addr1} [COUNTRY_A] {c1}"
-    text_b = f"[BUSINESS_B] {name2} [ADDRESS_B] {addr2} [COUNTRY_B] {c2}"
-    if aux_hints:
-        text_b += f" [HINTS] {aux_hints.strip()}"
-    return text_a, text_b
-
-class EntityPairDataset(torch.utils.data.Dataset):
-    def __init__(self, pairs, tokenizer, max_length=320):
-        self.pairs = pairs
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, idx):
-        item = self.pairs[idx]
-        if isinstance(item, dict):
-            text_a, text_b = format_structured_prompt(item["r1"], item["r2"], item.get("hints", ""))
-        elif len(item) == 4:
-            r1 = {"business_name": item[0], "business_address": item[1], "country": ""}
-            r2 = {"business_name": item[2], "business_address": item[3], "country": ""}
-            text_a, text_b = format_structured_prompt(r1, r2)
-        elif len(item) >= 6:
-            r1 = {"business_name": item[0], "business_address": item[1], "country": item[2]}
-            r2 = {"business_name": item[3], "business_address": item[4], "country": item[5]}
-            text_a, text_b = format_structured_prompt(r1, r2)
-        else:
-            text_a, text_b = str(item[0]), str(item[1])
-
-        encoding = self.tokenizer(
-            text_a, text_b,
-            max_length=self.max_length,
-            truncation=True,
-            return_tensors=None,
-        )
-        return encoding
-
-def load_cross_encoder(model_name="microsoft/deberta-v3-base", load_from_checkpoint=None):
+def load_cross_encoder(model_name="microsoft/deberta-v3-large", load_from_checkpoint=None):
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     candidate_paths = [
         load_from_checkpoint,
+        "/kaggle/working/models/deberta_v3_cross_encoder",
         "/kaggle/input/amazon-ml-challenge-2026/models-20260925T185207Z-1-001/models/deberta_v3_cross_encoder",
         "/kaggle/input/datasets/venkatesh21bit/amazon-ml-challenge-2026/models-20260925T185207Z-1-001/models/deberta_v3_cross_encoder",
-        "/kaggle/working/models/deberta_v3_cross_encoder",
         f"/kaggle/working/{load_from_checkpoint}" if load_from_checkpoint else None,
         os.path.join(os.getcwd(), load_from_checkpoint) if load_from_checkpoint else None,
     ]
@@ -461,11 +445,12 @@ def load_cross_encoder(model_name="microsoft/deberta-v3-base", load_from_checkpo
     )
     return tokenizer, model
 
-def predict_cross_encoder(pairs, tokenizer, model, device="cuda", batch_size=64, max_length=320):
+def predict_cross_encoder(texts_a, texts_b, tokenizer, model, device="cuda", batch_size=64, max_length=384):
     from transformers import DataCollatorWithPadding
     model.eval()
     model.to(device)
-    dataset = EntityPairDataset(pairs, tokenizer=tokenizer, max_length=max_length)
+    encodings = tokenizer(texts_a, texts_b, max_length=max_length, truncation=True, padding=False)
+    dataset = PreTokenizedDataset(encodings, [0] * len(texts_a))
     collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator, num_workers=2)
     all_probs = []
@@ -480,19 +465,11 @@ def predict_cross_encoder(pairs, tokenizer, model, device="cuda", batch_size=64,
             all_probs.append(probs)
     return np.concatenate(all_probs)
 
-def predict_cross_encoder_tta(pairs, tokenizer, model, device="cuda", batch_size=64, max_length=320, use_tta=True):
-    p_fwd = predict_cross_encoder(pairs, tokenizer, model, device=device, batch_size=batch_size, max_length=max_length)
+def predict_cross_encoder_tta(texts_a, texts_b, tokenizer, model, device="cuda", batch_size=64, max_length=384, use_tta=True):
+    p_fwd = predict_cross_encoder(texts_a, texts_b, tokenizer, model, device=device, batch_size=batch_size, max_length=max_length)
     if not use_tta:
         return p_fwd
-    swapped_pairs = []
-    for item in pairs:
-        if len(item) == 4:
-            swapped_pairs.append((item[2], item[3], item[0], item[1]))
-        elif len(item) >= 6:
-            swapped_pairs.append((item[3], item[4], item[5], item[0], item[1], item[2]))
-        else:
-            swapped_pairs.append((item[1], item[0]))
-    p_rev = predict_cross_encoder(swapped_pairs, tokenizer, model, device=device, batch_size=batch_size, max_length=max_length)
+    p_rev = predict_cross_encoder(texts_b, texts_a, tokenizer, model, device=device, batch_size=batch_size, max_length=max_length)
     return 0.5 * (p_fwd + p_rev)
 
 # 2. Self-contained Official Competition Macro F0.5 Metric
@@ -560,20 +537,25 @@ val_enriched = (
     .to_pandas()
 )
 
-val_eval_pairs = list(zip(
+val_texts_a = []
+val_texts_b = []
+for na, aa, ca, nb, ab, cb in zip(
     val_enriched["s1_name"].fillna("").astype(str),
     val_enriched["s1_addr"].fillna("").astype(str),
     val_enriched["s1_country"].fillna("").astype(str),
     val_enriched["o_name"].fillna("").astype(str),
     val_enriched["o_addr"].fillna("").astype(str),
     val_enriched["o_country"].fillna("").astype(str),
-))
+):
+    hints = make_hints(na, aa, ca, nb, ab, cb)
+    val_texts_a.append(f"[BUSINESS_A] {na} [ADDRESS_A] {aa} [COUNTRY_A] {ca}")
+    val_texts_b.append(f"[BUSINESS_B] {nb} [ADDRESS_B] {ab} [COUNTRY_B] {cb} [HINTS] {hints}")
 
-tokenizer, model = load_cross_encoder("microsoft/deberta-v3-base", load_from_checkpoint="models/deberta_v3_cross_encoder")
+tokenizer, model = load_cross_encoder("microsoft/deberta-v3-large", load_from_checkpoint="models/deberta_v3_cross_encoder")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print(f"Running DeBERTa inference on {len(val_eval_pairs):,} validation pairs (with TTA enabled)...")
-ce_val_probs = predict_cross_encoder_tta(val_eval_pairs, tokenizer, model, device=device, batch_size=64, max_length=320, use_tta=True)
+print(f"Running DeBERTa inference on {len(val_texts_a):,} validation pairs (with TTA enabled)...")
+ce_val_probs = predict_cross_encoder_tta(val_texts_a, val_texts_b, tokenizer, model, device=device, batch_size=64, max_length=384, use_tta=True)
 val_enriched["ce_prob"] = ce_val_probs
 
 # Print detailed probability diagnostics to inspect cross-encoder outputs
