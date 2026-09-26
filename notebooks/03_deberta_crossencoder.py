@@ -143,6 +143,21 @@ if "cand_train" in mined_path:
 else:
     train_mined = pl.read_parquet(mined_path)
 
+# Problem 6: GroupKFold Integrity on source1_entity_id
+# The same Source1 business must never appear in both train and validation
+possible_val_ids = [
+    "/kaggle/input/val_pairs/val_s1_ids.parquet",
+    "/kaggle/input/val-pairs/val_s1_ids.parquet",
+    "/kaggle/input/datasets/venkatesh21bit/val_pairs/val_s1_ids.parquet",
+    "cache/val_s1_ids.parquet",
+    "/kaggle/working/cache/val_s1_ids.parquet",
+]
+val_s1_f = next((p for p in possible_val_ids if os.path.exists(p)), None)
+if val_s1_f:
+    val_s1_set = set(pl.read_parquet(val_s1_f)["s1"].to_list())
+    train_mined = train_mined.filter(~pl.col("s1").is_in(val_s1_set))
+    print(f"GroupKFold Integrity (Problem 6): Excluded {len(val_s1_set):,} validation S1 entities from training.")
+
 print(f"Total Candidate Pairs Loaded: {len(train_mined):,}")
 
 # Problem 6 — Hard Negative Curriculum Training
@@ -437,6 +452,38 @@ class FocalTrainer(Trainer):
             loss = -(alpha_t * torch.pow(1.0 - p_t, self.gamma) * torch.log(p_t.clamp(min=1e-7))).mean()
         return (loss, outputs) if return_outputs else loss
 
+# Problem 7: Exponential Moving Average (EMA) of Model Weights
+from transformers import TrainerCallback
+
+class EMACallback(TrainerCallback):
+    """
+    Maintains Exponential Moving Average (EMA) of model weights during training.
+    Replaces model weights with EMA weights at training completion for maximum
+    generalization and validation stability on downstream evaluation.
+    """
+    def __init__(self, decay: float = 0.999):
+        self.decay = decay
+        self.ema_params = None
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        self.ema_params = {n: p.clone().detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if self.ema_params is None:
+            return
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if p.requires_grad and n in self.ema_params:
+                    self.ema_params[n].mul_(self.decay).add_(p.detach().cpu(), alpha=1.0 - self.decay)
+
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        if self.ema_params is not None:
+            with torch.no_grad():
+                for n, p in model.named_parameters():
+                    if n in self.ema_params:
+                        p.copy_(self.ema_params[n].to(p.device))
+            print("-> Successfully loaded Exponential Moving Average (EMA) weights for inference!")
+
 batch_size = 4 if "large" in chosen_model else 16
 accum_steps = 4 if "large" in chosen_model else 2
 num_epochs = 3
@@ -452,12 +499,14 @@ use_fp16 = (not use_bf16) and torch.cuda.is_available()
 
 print(f"Hardware Optimization (Problem 10): GPU={device_name.upper()} | bf16={use_bf16} | fp16={use_fp16} | gradient_checkpointing=True")
 
+# Problem 8: Cosine Learning Rate Schedule with Warmup
 training_args = TrainingArguments(
     output_dir=output_model_dir,
     num_train_epochs=num_epochs,
     per_device_train_batch_size=batch_size,
     learning_rate=1.5e-5 if "large" in chosen_model else 2e-5,
-    warmup_steps=warmup_steps,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.10,
     weight_decay=0.01,
     bf16=use_bf16,
     fp16=use_fp16,
@@ -474,6 +523,7 @@ trainer = FocalTrainer(
     args=training_args,
     train_dataset=train_dataset,
     data_collator=collator,
+    callbacks=[EMACallback(decay=0.999)],
     alpha=0.75,
     gamma=2.0,
 )
@@ -693,6 +743,48 @@ for row in gt_df.filter(pl.col("source1_entity_id").is_in(val_s1_list)).iter_row
     s1 = row["source1_entity_id"]
     matches = str(row["matched_entity_ids"]).split(",") if row["matched_entity_ids"] else []
     val_gt_dict[s1] = set(matches)
+
+# Problem 10: Calibrate Probabilities Before Thresholding (Temperature Scaling)
+class TemperatureScaler:
+    def __init__(self):
+        self.temperature = 1.0
+
+    def fit(self, probs: np.ndarray, labels: np.ndarray):
+        from scipy.optimize import minimize
+        eps = 1e-7
+        p_clip = np.clip(probs, eps, 1.0 - eps)
+        logits = np.log(p_clip / (1.0 - p_clip))
+
+        def nll_loss(t):
+            temp = max(float(t[0]), 0.05)
+            scaled = logits / temp
+            loss = np.maximum(scaled, 0) - scaled * labels + np.log1p(np.exp(-np.abs(scaled)))
+            return float(np.mean(loss))
+
+        res = minimize(nll_loss, [1.0], bounds=[(0.05, 10.0)], method="L-BFGS-B")
+        self.temperature = float(res.x[0])
+        print(f"Optimal Temperature Scaling T* = {self.temperature:.3f}")
+        return self.temperature
+
+    def calibrate(self, probs: np.ndarray) -> np.ndarray:
+        eps = 1e-7
+        p_clip = np.clip(probs, eps, 1.0 - eps)
+        logits = np.log(p_clip / (1.0 - p_clip))
+        scaled = logits / self.temperature
+        return 1.0 / (1.0 + np.exp(-scaled))
+
+# Calibrate validation probabilities using validation ground-truth matches
+val_gt_pairs = set()
+for s1, targets in val_gt_dict.items():
+    for target in targets:
+        val_gt_pairs.add((s1, target))
+
+val_binary_labels = np.array([1 if (s1, o) in val_gt_pairs else 0 for s1, o in zip(val_enriched["s1"], val_enriched["o"])])
+if len(np.unique(val_binary_labels)) > 1:
+    temp_scaler = TemperatureScaler()
+    temp_scaler.fit(ce_val_probs, val_binary_labels)
+    val_enriched["ce_prob"] = temp_scaler.calibrate(ce_val_probs)
+    print("Probabilities calibrated via learned temperature before thresholding.")
 
 # Evaluate Standalone DeBERTa-v3 Macro F0.5 with Graph Clustering (Problem 14)
 ce_cand_scores = defaultdict(list)
