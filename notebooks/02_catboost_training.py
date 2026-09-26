@@ -701,11 +701,12 @@ test_so_df = pl.concat([s2_df, s3_df])
 del s2_df, s3_df
 gc.collect()
 
-# 4. Filter top candidate pairs per S1 entity (covers 97% of true matches)
+# 4. Filter top candidate pairs per S1 entity safely using predicate pushdown
 print(f"Filtering top candidate pairs from {test_cand_p}...")
 test_cands = (
     pl.scan_parquet(test_cand_p)
-    .filter((pl.col("sn") + pl.col("sa")) >= 40.0)
+    .filter(pl.col("slot") == 0)
+    .filter((pl.col("sn") + pl.col("sa")) >= 25.0)
     .select(["s1", "o", "sn", "sa", "slot"])
     .sort(pl.col("sn") + pl.col("sa"), descending=True)
     .group_by("s1")
@@ -715,36 +716,62 @@ test_cands = (
 n_cands = len(test_cands)
 print(f"Top Candidate Pairs to Score with CatBoost: {n_cands:,}")
 
-# 5. Load trained CatBoost model(s)
-if "clf_model" not in globals() or clf_model is None:
-    from catboost import CatBoostClassifier
-    model_paths = [
-        f"pretrained_models/catboost_v4_fold{k}.cbm" for k in range(5) if os.path.exists(f"pretrained_models/catboost_v4_fold{k}.cbm")
-    ]
-    if not model_paths and os.path.exists("pretrained_models/catboost_v4_classifier.cbm"):
-        model_paths = ["pretrained_models/catboost_v4_classifier.cbm"]
-    
-    scoring_models = []
-    for mp in model_paths:
-        m = CatBoostClassifier()
-        m.load_model(mp)
-        scoring_models.append(m)
-    print(f"Loaded {len(scoring_models)} CatBoost model(s) for ensembled inference.")
+# 5. Load trained CatBoost model(s) with robust multi-directory fallback
+from catboost import CatBoostClassifier
+scoring_models = []
+if "models_cls" in globals() and models_cls:
+    scoring_models = models_cls
+elif "clf_model" in globals() and clf_model is not None:
+    scoring_models = [clf_model]
 else:
-    scoring_models = [clf_model] if "models_cls" not in globals() else models_cls
-    print(f"Using {len(scoring_models)} model(s) currently in memory.")
+    possible_model_dirs = [
+        "pretrained_models",
+        "models",
+        "/kaggle/working/pretrained_models",
+        "/content/pretrained_models",
+        "/content/drive/MyDrive/Amazon_ML_Dataset/pretrained_models",
+        "/content/drive/MyDrive/Amazon_ML_Challenge/pretrained_models",
+    ]
+    for m_dir in possible_model_dirs:
+        for k in range(5):
+            p = os.path.join(m_dir, f"catboost_v4_fold{k}.cbm")
+            if os.path.exists(p):
+                m = CatBoostClassifier()
+                m.load_model(p)
+                scoring_models.append(m)
+        if scoring_models:
+            print(f"Loaded {len(scoring_models)} fold models from {m_dir}")
+            break
+    if not scoring_models:
+        for m_dir in possible_model_dirs:
+            p = os.path.join(m_dir, "catboost_v4_classifier.cbm")
+            if os.path.exists(p):
+                m = CatBoostClassifier()
+                m.load_model(p)
+                scoring_models.append(m)
+                print(f"Loaded single classifier model from {p}")
+                break
 
-# Calibration temperature and threshold
+if not scoring_models:
+    raise FileNotFoundError("Could not find any CatBoost model checkpoints on disk!")
+
+print(f"Active Ensemble: {len(scoring_models)} CatBoost model(s) for GPU inference.")
+
+# Calibration temperature and threshold (optimal from Stage 7)
 T_val = T_opt if "T_opt" in globals() else 0.50
-thresh = best_t if "best_t" in globals() else 0.50
+thresh = best_t if "best_t" in globals() else 0.30
 print(f"Operating Parameters: Calibration T* = {T_val:.3f}, Threshold t* = {thresh:.2f}")
 
-# 6. Chunked Batch Feature Extraction & GPU Inference
-batch_size = 200_000
+# 6. Chunked Batch Feature Extraction & GPU Inference (RAM bounded < 1.5 GB)
+import time
+batch_size = 100_000
 kept_edges = []
+total_batches = (n_cands + batch_size - 1) // batch_size
 
-print(f"\nRunning CatBoost GPU Inference in batches of {batch_size:,}...")
-for start_idx in range(0, n_cands, batch_size):
+print(f"\nRunning CatBoost GPU Inference in {total_batches} batches of {batch_size:,}...")
+t_start = time.time()
+for b_idx, start_idx in enumerate(range(0, n_cands, batch_size)):
+    t0 = time.time()
     end_idx = min(start_idx + batch_size, n_cands)
     chunk = test_cands.slice(start_idx, end_idx - start_idx)
     
@@ -794,7 +821,12 @@ for start_idx in range(0, n_cands, batch_size):
     for s, o_val, sc in zip(s1_kept, o_kept, scores_kept):
         kept_edges.append((s, o_val, float(sc)))
         
-    print(f"  Processed {end_idx:,} / {n_cands:,} pairs -> {len(kept_edges):,} matches kept so far")
+    dt_batch = time.time() - t0
+    elapsed = time.time() - t_start
+    pairs_done = end_idx
+    rate = pairs_done / elapsed if elapsed > 0 else 1.0
+    eta_sec = (n_cands - pairs_done) / rate if rate > 0 else 0.0
+    print(f"  Batch {b_idx + 1:2d}/{total_batches}: {end_idx:,} / {n_cands:,} pairs ({rate:.0f} pairs/s, ETA: {eta_sec/60:.1f}m) -> {len(kept_edges):,} matches kept so far")
     del chunk_enriched, X_chunk
     gc.collect()
 
