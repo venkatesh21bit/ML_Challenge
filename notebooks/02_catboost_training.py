@@ -129,9 +129,9 @@ if cand_path is None:
 print(f"Loading candidate pairs from: {cand_path}")
 
 if "cand_train" in cand_path:
-    # 1. Select 25,000 complete S1 entities (covers ~86,000 true positive matches across ALL slots)
+    # 1. Select 25,000 complete S1 entities (sorted to guarantee 100% deterministic reproducibility)
     n_sample_entities = 25_000
-    target_s1_list = gt_clean.select("s1").unique().head(n_sample_entities)["s1"].to_list()
+    target_s1_list = gt_clean.select("s1").unique().sort("s1").head(n_sample_entities)["s1"].to_list()
     target_s1_set = set(target_s1_list)
 
     print(f"Scanning {cand_path} for {len(target_s1_list):,} complete entities across ALL candidate slots...")
