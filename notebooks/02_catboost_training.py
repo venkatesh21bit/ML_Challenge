@@ -482,6 +482,39 @@ for row in gt_raw.filter(pl.col("source1_entity_id").is_in(val_s1_list)).iter_ro
     matches = str(row["matched_entity_ids"]).split(",") if row["matched_entity_ids"] else []
     val_gt_dict[s1] = set(matches)
 
+# 4. Compute Candidate Pool Coverage Ceiling
+all_cand_o = defaultdict(set)
+for s1, o in zip(val_df["s1"], val_df["o"]):
+    all_cand_o[s1].add(o)
+
+total_gt_matches = sum(len(ts) for ts in val_gt_dict.values())
+cand_captured_matches = sum(len(val_gt_dict[s1] & all_cand_o[s1]) for s1 in val_gt_dict if s1 in all_cand_o)
+cand_ceiling = cand_captured_matches / total_gt_matches if total_gt_matches > 0 else 0.0
+
+print(f"\nValidation Candidate Pool Diagnostics:")
+print(f"  Total Ground Truth Matches for Val Entities: {total_gt_matches:,}")
+print(f"  Matches Present in Candidate Subset:         {cand_captured_matches:,}")
+print(f"  --> Maximum Possible Candidate Recall Ceiling: {cand_ceiling * 100:.2f}%")
+
+def compute_metrics_detailed(predictions: dict, ground_truth: dict, beta: float = 0.5):
+    scores, precisions, recalls = [], [], []
+    for s1_eid, true_set in ground_truth.items():
+        pred_set = predictions.get(s1_eid, set())
+        if not true_set:
+            scores.append(1.0 if not pred_set else 0.0)
+            precisions.append(1.0 if not pred_set else 0.0)
+            recalls.append(1.0)
+            continue
+        tp = len(pred_set & true_set)
+        fp = len(pred_set - true_set)
+        fn = len(true_set - pred_set)
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        precisions.append(p)
+        recalls.append(r)
+        scores.append(f_beta(p, r, beta))
+    return float(np.mean(scores)), float(np.mean(precisions)), float(np.mean(recalls))
+
 # Evaluate both Classifier Alone and Dual Blend
 for name, prob_col in eval_candidates:
     print(f"\n--- Sweeping Thresholds for {name} ---")
@@ -490,17 +523,20 @@ for name, prob_col in eval_candidates:
         val_cand_scores[s1].append((o, float(prob)))
 
     best_score = 0.0
-    best_t = 0.30
+    best_t = 0.15
+    best_p, best_r = 0.0, 0.0
     for t in np.arange(0.10, 0.75, 0.05):
         t_round = round(t, 2)
         val_clusters = cluster_candidate_predictions(val_cand_scores, threshold=t_round)
-        score = compute_f05_macro(val_clusters, val_gt_dict)
-        print(f"Threshold t = {t_round:.2f} -> Macro F0.5: {score:.4f}")
+        score, p_val, r_val = compute_metrics_detailed(val_clusters, val_gt_dict)
+        print(f"t = {t_round:.2f} | Precision: {p_val:.4f} | Recall: {r_val:.4f} | Macro F0.5: {score:.4f}")
         if score > best_score:
             best_score = score
             best_t = t_round
+            best_p = p_val
+            best_r = r_val
 
-    print(f"--> {name} Best Macro F0.5: {best_score:.4f} at t* = {best_t:.2f}")
+    print(f"--> {name} Best Macro F0.5: {best_score:.4f} (Precision: {best_p:.4f}, Recall: {best_r:.4f}) at t* = {best_t:.2f}")
 
 print("=" * 65)
 print(f"MACRO F0.5 OPTIMIZATION COMPLETE")
