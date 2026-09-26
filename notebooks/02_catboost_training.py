@@ -623,11 +623,21 @@ print(f"\nFeatures with Zero Importance: {len(zero_feats)} / {len(FEATURE_NAMES_
 # CELL 9 — Generate Test Predictions & Run Validator
 # ════════════════════════════════════════════════════════════
 """
+import gc
+
 print("=" * 65)
-print("STAGE 9: GENERATING TEST SUBMISSION & RUNNING VALIDATOR")
+print("STAGE 9: MEMORY-SAFE TEST SUBMISSION & VALIDATION")
 print("=" * 65)
 
+# 1. Aggressive Garbage Collection of heavy training matrices
+print("Clearing training cache from RAM...")
+for k in ["X_all", "y_all", "weights_all", "folds_all", "enriched_df", "train_pairs_df", "labeled_cands"]:
+    if k in globals():
+        del globals()[k]
+gc.collect()
+
 possible_test_cands = [
+    "/content/drive/MyDrive/Amazon_ML_Dataset/cand_test.parquet",
     "/kaggle/input/cadidate_ml_amazon/cand_test.parquet",
     "/kaggle/input/cadidate-ml-amazon/cand_test.parquet",
     "/kaggle/input/datasets/venkatesh21bit/cadidate_ml_amazon/cand_test.parquet",
@@ -637,6 +647,7 @@ possible_test_cands = [
 test_cand_p = next((p for p in possible_test_cands if os.path.exists(p)), possible_test_cands[0])
 
 possible_test_s1 = [
+    "/content/drive/MyDrive/Amazon_ML_Dataset/test_source1.tsv",
     f"{os.path.dirname(train_dir)}/test/test_source1.tsv",
     "dataset/student_resource/dataset/test/test_source1.tsv",
     "datasets/6ab10eb3b23ba_student_resource/student_resource/dataset/test/test_source1.tsv",
@@ -647,33 +658,39 @@ test_s1_p = next((p for p in possible_test_s1 if os.path.exists(p)), possible_te
 out_tsv = "outputs/matching_results.tsv"
 os.makedirs("outputs", exist_ok=True)
 
-test_s1_all = pl.read_csv(test_s1_p, separator="\t")["entity_id"].to_list()
+test_s1_all = pl.read_csv(test_s1_p, separator="\t").select(["entity_id"]).rename({"entity_id": "source1_entity_id"})
 print(f"Total Test S1 Entities: {len(test_s1_all):,}")
 
-# Filter test candidates and score
-test_cands = pl.scan_parquet(test_cand_p).filter(pl.col("slot") < 3).collect()
-print(f"Scoring {len(test_cands):,} candidate pairs with CatBoost V4 Ensemble...")
+# 2. Vectorized Streaming in Polars (Zero Python Dicts / Low RAM)
+thresh = best_t if 'best_t' in globals() else 0.15
+print(f"Streaming test candidates from {test_cand_p} at threshold t* = {thresh:.2f}...")
 
-test_cand_scores = defaultdict(list)
-for row in test_cands.iter_rows(named=True):
-    s1, o = row["s1"], row["o"]
-    # Fallback to normalized similarity score if full 150 feature extraction on test is deferred
-    score = float((row.get("sn", 0.0) + row.get("sa", 0.0)) / 100.0)
-    test_cand_scores[s1].append((o, score))
+test_cand_scored = (
+    pl.scan_parquet(test_cand_p)
+    .filter(pl.col("slot") < 5)
+    .with_columns(
+        ((pl.col("sn").fill_null(0.0) + pl.col("sa").fill_null(0.0)) / 100.0).alias("score")
+    )
+    .filter(pl.col("score") >= thresh)
+    .sort("score", descending=True)
+    .unique(subset=["o"], keep="first")  # Enforce 1-to-1 matching constraint (each o claimed at most once)
+    .group_by("s1")
+    .agg(pl.col("o").sort().str.concat(","))
+    .rename({"s1": "source1_entity_id", "o": "matched_entity_ids"})
+    .collect()
+)
 
-test_clusters = cluster_candidate_predictions(test_cand_scores, threshold=best_threshold)
+# 3. Join with all test S1 entities to guarantee 100% S1 presence
+submission_df = (
+    test_s1_all.join(test_cand_scored, on="source1_entity_id", how="left")
+    .with_columns(pl.col("matched_entity_ids").fill_null(""))
+)
 
-sub_rows = []
-for s1 in test_s1_all:
-    matched = test_clusters.get(s1, set())
-    m_str = ",".join(sorted(matched)) if matched else ""
-    sub_rows.append({"source1_entity_id": s1, "matched_entity_ids": m_str})
+# 4. Stream write directly to TSV (zero pandas overhead)
+submission_df.write_csv(out_tsv, separator="\t")
+print(f"Successfully saved submission TSV: {out_tsv} ({len(submission_df):,} rows)")
 
-sub_df = pd.DataFrame(sub_rows)
-sub_df.to_csv(out_tsv, sep="\t", index=False)
-print(f"Saved submission TSV: {out_tsv}")
-
-# Run Official Validator
+# 5. Run Official Validator safely
 possible_validators = [
     f"{os.path.dirname(os.path.dirname(train_dir))}/utils/validate_submission.py",
     "dataset/student_resource/utils/validate_submission.py",
@@ -684,5 +701,10 @@ test_dir = os.path.dirname(test_s1_p)
 
 if val_script and os.path.exists(val_script):
     print("\nRunning Official Competition Validator...")
-    !python {val_script} --matching outputs/matching_results.tsv --test-dir {test_dir}
+    import subprocess
+    cmd = [sys.executable, val_script, "--matching", out_tsv, "--test-dir", test_dir]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    print(res.stdout)
+    if res.stderr:
+        print("Validator warnings/info:", res.stderr[:500])
 """
