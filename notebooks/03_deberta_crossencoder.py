@@ -916,7 +916,14 @@ X_meta = np.column_stack([
     logit_cb,
     logit_ce,
 ])
-y_meta = val_enriched["label"].to_numpy()
+if "label" in val_enriched.columns:
+    y_meta = val_enriched["label"].to_numpy()
+elif "val_binary_labels" in globals():
+    y_meta = val_binary_labels
+else:
+    val_gt_pairs = set((s1, target) for s1, targets in val_gt_dict.items() for target in targets)
+    y_meta = np.array([1 if (s1, o) in val_gt_pairs else 0 for s1, o in zip(val_enriched["s1"], val_enriched["o"])])
+val_enriched["label"] = y_meta
 
 meta_clf = LogisticRegression(class_weight={0: 1.0, 1: 2.0}, C=1.0, max_iter=500, random_state=42)
 meta_clf.fit(X_meta, y_meta)
