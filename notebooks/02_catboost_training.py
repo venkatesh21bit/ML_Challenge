@@ -661,21 +661,21 @@ os.makedirs("outputs", exist_ok=True)
 test_s1_all = pl.read_csv(test_s1_p, separator="\t").select(["entity_id"]).rename({"entity_id": "source1_entity_id"})
 print(f"Total Test S1 Entities: {len(test_s1_all):,}")
 
-# 2. Vectorized Streaming in Polars (Zero Python Dicts / Low RAM)
-thresh = best_t if 'best_t' in globals() else 0.15
-print(f"Streaming test candidates from {test_cand_p} at threshold t* = {thresh:.2f}...")
+# 2. Vectorized Streaming in Polars with Parquet Predicate Pushdown (Takes < 4s, < 500MB RAM)
+thresh = best_t if 'best_t' in globals() else 0.65
+min_sim = float(thresh * 100.0)
+print(f"Streaming test candidates from {test_cand_p} at threshold t* = {thresh:.2f} (similarity >= {min_sim:.1f})...")
 
 test_cand_scored = (
     pl.scan_parquet(test_cand_p)
-    .filter(pl.col("slot") < 5)
+    .filter((pl.col("slot") < 3) & ((pl.col("sn") + pl.col("sa")) >= min_sim))
     .with_columns(
         ((pl.col("sn").fill_null(0.0) + pl.col("sa").fill_null(0.0)) / 100.0).alias("score")
     )
-    .filter(pl.col("score") >= thresh)
     .sort("score", descending=True)
     .unique(subset=["o"], keep="first")  # Enforce 1-to-1 matching constraint (each o claimed at most once)
     .group_by("s1")
-    .agg(pl.col("o").sort().str.concat(","))
+    .agg(pl.col("o").sort().str.join(","))
     .rename({"s1": "source1_entity_id", "o": "matched_entity_ids"})
     .collect()
 )
@@ -686,13 +686,14 @@ submission_df = (
     .with_columns(pl.col("matched_entity_ids").fill_null(""))
 )
 
-# 4. Stream write directly to TSV (zero pandas overhead)
-submission_df.write_csv(out_tsv, separator="\t")
+# 4. Stream write directly to TSV without quotes (passes official validator formatting)
+submission_df.write_csv(out_tsv, separator="\t", quote_style="never", null_value="")
 print(f"Successfully saved submission TSV: {out_tsv} ({len(submission_df):,} rows)")
 
 # 5. Run Official Validator safely
 possible_validators = [
     f"{os.path.dirname(os.path.dirname(train_dir))}/utils/validate_submission.py",
+    "/content/drive/MyDrive/Amazon_ML_Dataset/validate_submission.py",
     "dataset/student_resource/utils/validate_submission.py",
     "datasets/6ab10eb3b23ba_student_resource/student_resource/utils/validate_submission.py",
 ]
